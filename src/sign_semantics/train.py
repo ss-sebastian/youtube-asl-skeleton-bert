@@ -258,6 +258,30 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
                 global_step += 1
+                progress_every = int(train_config.get("progress_every", 5))
+                if global_step % progress_every == 0 or last_batch:
+                    elapsed = time.perf_counter() - epoch_started
+                    clips_per_second = epoch_clips / max(elapsed, 1e-9)
+                    eta_seconds = (len(train_data) - epoch_clips) / max(
+                        clips_per_second, 1e-9
+                    )
+                    progress_record = {
+                        "epoch": epoch + 1,
+                        "optimizer_step": global_step,
+                        "clips": epoch_clips,
+                        "total_clips": len(train_data),
+                        "percent": round(100 * epoch_clips / len(train_data), 2),
+                        "clips_per_second": round(clips_per_second, 3),
+                        "eta_seconds": round(eta_seconds),
+                        "train_loss_so_far": round(
+                            epoch_totals["loss"] / max(epoch_clips, 1), 6
+                        ),
+                    }
+                    print(
+                        "training_progress="
+                        + json.dumps(progress_record, sort_keys=True),
+                        flush=True,
+                    )
                 if global_step % train_config["log_every"] == 0:
                     progress.set_postfix(
                         step=global_step,

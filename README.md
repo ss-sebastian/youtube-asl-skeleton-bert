@@ -51,6 +51,13 @@ GPU runtime, and run the cells. The notebook:
    `MyDrive/sign_semantics_youtube_asl/` when Drive is available;
 7. removes the local shard after successful training.
 
+During training, a live progress bar reports processed clips, throughput, loss,
+optimizer steps, and ETA. At the end of every epoch, the trainer prints one
+machine-readable `epoch_metrics` JSON record containing train/validation total,
+body, hands, and face losses, elapsed time, and clips per second. The loader uses
+fast JSON decoding, reads only the selected 37 facial landmarks, and prefetches
+batches with persistent workers to keep the GPU supplied.
+
 If Colab's Drive credential propagation fails, the notebook keeps training and
 downloads a compact resume ZIP after every completed shard. Save the newest ZIP.
 Before the next session, upload it to Colab as

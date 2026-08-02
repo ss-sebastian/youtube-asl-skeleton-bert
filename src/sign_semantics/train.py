@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import time
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -9,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from .data import YouTubeASLPoseDataset
 from .features import STREAM_JOINTS
@@ -95,26 +98,36 @@ def validate(
     mask_probability: float,
     span_length: int,
     velocity_weight: float,
-) -> float:
+) -> dict[str, float]:
     model.eval()
-    losses: list[float] = []
+    totals = {"loss": 0.0, **{name: 0.0 for name in STREAM_JOINTS}}
+    clips = 0
     generator = torch.Generator().manual_seed(0)
+    progress = tqdm(total=len(loader.dataset), desc="validation", unit="clips", leave=False)
     for batch in loader:
         streams, observed, valid = move_batch(batch, device)
         mask = sample_span_mask(valid, mask_probability, span_length, generator)
         predictions = model(streams, valid, mask)
-        loss, _ = masked_reconstruction_loss(
+        loss, stream_losses = masked_reconstruction_loss(
             predictions, streams, mask & valid, velocity_weight, observed
         )
-        losses.append(float(loss))
-    return sum(losses) / max(len(losses), 1)
+        batch_clips = int(valid.shape[0])
+        clips += batch_clips
+        totals["loss"] += float(loss) * batch_clips
+        for name, value in stream_losses.items():
+            totals[name] += value * batch_clips
+        progress.update(batch_clips)
+    progress.close()
+    return {name: value / max(clips, 1) for name, value in totals.items()}
 
 
 def run_training(config_path: Path, resume: Path | None = None) -> None:
     config = load_json(config_path)
     seed_everything(int(config["seed"]))
     device = choose_device()
-    print(f"Using device: {device}")
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+    print(f"Using device: {device}", flush=True)
 
     data_config = config["data"]
     train_data = YouTubeASLPoseDataset(
@@ -133,6 +146,12 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
     )
     train_config = config["training"]
     pin_memory = device.type == "cuda"
+    worker_options = {}
+    if data_config["num_workers"] > 0:
+        worker_options = {
+            "persistent_workers": True,
+            "prefetch_factor": int(data_config.get("prefetch_factor", 2)),
+        }
     train_loader = DataLoader(
         train_data,
         batch_size=train_config["batch_size"],
@@ -140,6 +159,7 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         num_workers=data_config["num_workers"],
         pin_memory=pin_memory,
         drop_last=False,
+        **worker_options,
     )
     val_loader = DataLoader(
         val_data,
@@ -147,6 +167,7 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         shuffle=False,
         num_workers=data_config["num_workers"],
         pin_memory=pin_memory,
+        **worker_options,
     )
 
     model_config = SkeletonBertConfig(**config["model"])
@@ -163,7 +184,7 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
     )
     scheduler = cosine_schedule(optimizer, train_config["warmup_steps"], total_steps)
     amp_enabled = bool(train_config["amp"] and device.type == "cuda")
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
     start_epoch = 0
     global_step = 0
     best_val = float("inf")
@@ -176,17 +197,26 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         start_epoch = int(checkpoint["epoch"]) + 1
         global_step = int(checkpoint["global_step"])
         best_val = float(checkpoint.get("best_val", best_val))
-        print(f"Resumed from epoch {start_epoch}")
+        print(f"Resumed from epoch {start_epoch}", flush=True)
 
     output_dir = Path(train_config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     mask_config = config["masking"]
 
     for epoch in range(start_epoch, train_config["epochs"]):
+        epoch_started = time.perf_counter()
         model.train()
         optimizer.zero_grad(set_to_none=True)
         running = 0.0
         logged_batches = 0
+        epoch_totals = {"loss": 0.0, **{name: 0.0 for name in STREAM_JOINTS}}
+        epoch_clips = 0
+        progress = tqdm(
+            total=len(train_data),
+            desc=f"epoch {epoch + 1}/{train_config['epochs']}",
+            unit="clips",
+            dynamic_ncols=True,
+        )
         for batch_index, batch in enumerate(train_loader):
             streams, observed, valid = move_batch(batch, device)
             mask = sample_span_mask(
@@ -212,6 +242,12 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
             scaler.scale(scaled_loss).backward()
             running += float(loss.detach())
             logged_batches += 1
+            batch_clips = int(valid.shape[0])
+            epoch_clips += batch_clips
+            epoch_totals["loss"] += float(loss.detach()) * batch_clips
+            for name, value in stream_losses.items():
+                epoch_totals[name] += value * batch_clips
+            progress.update(batch_clips)
 
             last_batch = batch_index + 1 == len(train_loader)
             if (batch_index + 1) % accumulation == 0 or last_batch:
@@ -223,18 +259,19 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
                 scheduler.step()
                 global_step += 1
                 if global_step % train_config["log_every"] == 0:
-                    details = " ".join(
-                        f"{key}={value:.4f}" for key, value in stream_losses.items()
-                    )
-                    print(
-                        f"epoch={epoch + 1} step={global_step} "
-                        f"loss={running / max(logged_batches, 1):.4f} "
-                        f"lr={scheduler.get_last_lr()[0]:.2e} {details}"
+                    progress.set_postfix(
+                        step=global_step,
+                        loss=f"{running / max(logged_batches, 1):.4f}",
+                        lr=f"{scheduler.get_last_lr()[0]:.2e}",
                     )
                     running = 0.0
                     logged_batches = 0
+        progress.close()
 
-        val_loss = validate(
+        train_metrics = {
+            name: value / max(epoch_clips, 1) for name, value in epoch_totals.items()
+        }
+        val_metrics = validate(
             model,
             val_loader,
             device,
@@ -242,7 +279,18 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
             mask_config["mean_span_length"],
             mask_config["velocity_weight"],
         )
-        print(f"epoch={epoch + 1} val_loss={val_loss:.4f}")
+        epoch_seconds = time.perf_counter() - epoch_started
+        epoch_metrics = {
+            "epoch": epoch + 1,
+            "optimizer_steps": global_step,
+            "train_clips": epoch_clips,
+            "seconds": round(epoch_seconds, 1),
+            "clips_per_second": round(epoch_clips / max(epoch_seconds, 1e-9), 3),
+            **{f"train_{name}": round(value, 6) for name, value in train_metrics.items()},
+            **{f"val_{name}": round(value, 6) for name, value in val_metrics.items()},
+        }
+        print("epoch_metrics=" + json.dumps(epoch_metrics, sort_keys=True), flush=True)
+        val_loss = val_metrics["loss"]
         payload = {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),

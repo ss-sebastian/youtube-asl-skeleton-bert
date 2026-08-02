@@ -110,6 +110,28 @@ class PipelineTest(unittest.TestCase):
         self.assertFalse(observed["hands"][1, :21].any())
         self.assertTrue(np.all(streams["hands"][1, :21] == 0))
 
+    def test_long_validation_clip_selects_frames_before_feature_conversion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "raw_keypoints_1.zip"
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as handle:
+                handle.writestr(
+                    "raw_keypoints/clip_long.json",
+                    json.dumps(youtube_asl_payload(frames=30)),
+                )
+            annotations = root / "dev.json"
+            annotations.write_text(
+                json.dumps({"video": {"clip_order": ["clip_long"]}}),
+                encoding="utf-8",
+            )
+
+            item = YouTubeASLPoseDataset(
+                archive, annotations, max_frames=10, training=False
+            )[0]
+            expected = np.linspace(0, 29, 10).round().astype(np.int64).tolist()
+            self.assertEqual(item["frame_indices"].tolist(), expected)
+            self.assertEqual(int(item["valid"].sum()), 10)
+
     def test_word_boundaries_and_rsa(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

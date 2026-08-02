@@ -6,7 +6,8 @@
     "train_annotations": "data/raw/YT.translations.train.json",
     "val_annotations": "data/raw/YT.translations.dev.json",
     "max_frames": 256,
-    "num_workers": 4
+    "num_workers": 4,
+    "prefetch_factor": 4
   },
   "model": {
     "hidden_size": 256,
@@ -24,7 +25,7 @@
   },
   "training": {
     "output_dir": "outputs/pretrain",
-    "batch_size": 16,
+    "batch_size": 32,
     "epochs": 1,
     "learning_rate": 0.0003,
     "weight_decay": 0.01,

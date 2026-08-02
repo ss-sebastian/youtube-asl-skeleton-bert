@@ -51,8 +51,9 @@ GPU runtime, and run the cells. The notebook:
    `MyDrive/sign_semantics_youtube_asl/`;
 7. removes the local shard after successful training.
 
-Run `MODE = "pilot"` first. It uses a limited number of clips from shard 1 to
-verify GPU, data, loss, and Drive output. Then set `MODE = "full"`. If Colab
+The committed Colab notebook now defaults to `MODE = "full"` after the pilot was
+successfully completed. For a fresh environment, set `MODE = "pilot"` to
+verify GPU, data, loss, and Drive output before returning to full mode. If Colab
 disconnects between shards, rerunning the notebook reads the completion state
 from Drive and continues with the next shard.
 

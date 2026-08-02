@@ -115,6 +115,15 @@ python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
 ```
 
+### Google Colab
+
+Use [notebooks/colab_pretrain.ipynb](notebooks/colab_pretrain.ipynb) for GPU training.
+The notebook mounts Google Drive for archives and checkpoints, copies code and training
+data to the Colab VM for faster small-file access, resumes from `last.pt`, and exports
+layer-wise representations back to Drive. Before running it, either push this repository
+to GitHub and set `REPO_URL`, or upload the project folder to
+`MyDrive/sign_language_llm`.
+
 ## Data preparation
 
 Download each official keypoint split into a separate directory. Each sentence clip must

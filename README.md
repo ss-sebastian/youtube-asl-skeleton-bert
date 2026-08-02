@@ -42,20 +42,27 @@ the ZIP without extraction, and is deleted after that stage finishes.
 Open [`notebooks/colab_pretrain.ipynb`](notebooks/colab_pretrain.ipynb), select a
 GPU runtime, and run the cells. The notebook:
 
-1. mounts Google Drive for model outputs only;
+1. attempts to mount Google Drive for model outputs only;
 2. clones this GitHub repository into `/content`;
 3. downloads the small official train/dev annotation files into `/content`;
 4. downloads one keypoint shard at a time into `/content`;
 5. trains directly from that ZIP;
 6. saves `last.pt`, `best.pt`, logs, and completion state under
-   `MyDrive/sign_semantics_youtube_asl/`;
+   `MyDrive/sign_semantics_youtube_asl/` when Drive is available;
 7. removes the local shard after successful training.
+
+If Colab's Drive credential propagation fails, the notebook keeps training and
+downloads a compact resume ZIP after every completed shard. Save the newest ZIP.
+Before the next session, upload it to Colab as
+`/content/youtube_asl_full_resume.zip`; the notebook restores the completion
+state and checkpoints automatically, skips finished shards, and continues with
+the next shard. Dataset shards remain temporary and are never copied to Drive.
 
 The committed Colab notebook now defaults to `MODE = "full"` after the pilot was
 successfully completed. For a fresh environment, set `MODE = "pilot"` to
 verify GPU, data, loss, and Drive output before returning to full mode. If Colab
 disconnects between shards, rerunning the notebook reads the completion state
-from Drive and continues with the next shard.
+from Drive or the uploaded resume bundle and continues with the next shard.
 
 Ten 37 GB downloads plus training are not expected to finish in one free Colab
 session. The notebook is intentionally resumable across sessions.

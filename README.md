@@ -1,112 +1,83 @@
-# Sign Language LLM
+# Skeleton BERT for Sign Semantics
 
-## Project idea
+This repository tests whether word-level semantic geometry appears in a model trained only
+to reconstruct masked skeleton trajectories from continuous sign-language sentences.
 
-This project extends prior work on multilingual semantic representations in mBERT from variation across spoken/written languages to variation across modalities.
+The skeleton model is a small, randomly initialized Hugging Face `BertModel`. It receives
+no text, gloss, word boundary, translation, class label, or pretrained language weight
+during training. Gloss and time boundaries are used only after training to locate word
+tokens in held-out sentences for RSA.
 
-The central question is:
-
-> Can a model trained on sign-language input develop semantic representations that align with spoken-language semantic spaces, beyond modality-specific visuomotor form?
-
-## Working hypothesis
-
-A sign-language encoder may exhibit a representational hierarchy:
-
-1. early layers primarily encode pose, motion, and sensorimotor structure;
-2. intermediate layers encode sign-level and compositional structure;
-3. later layers develop more abstract semantic organization that aligns with representations from English, Chinese, Spanish, and multilingual language models.
-
-## Candidate datasets
-
-- **How2Sign (preferred):** continuous ASL video paired with English translations; suitable for testing emergence without mandatory gloss supervision.
-- **PHOENIX-2014T:** continuous DGS with glosses and translations; useful as a benchmark, but gloss supervision can introduce symbolic or language leakage.
-- **WLASL:** isolated ASL signs with word labels; useful for controlled lexical RSA, but less suitable for sentence- or language-level structure.
-
-## Proposed representation pipeline
+## Pipeline
 
 ```text
-sign video
-  -> body, hand, and facial landmark extraction
-  -> spatiotemporal pose/graph sequence
-  -> graph, motion, or spatiotemporal Transformer encoder
-  -> layer-wise latent representations
+TRAINING
+How2Sign sentence-level OpenPose JSON
+  -> body + hands + face arrays
+  -> per-frame neck/shoulder normalization
+  -> random sentence window and padding
+  -> mask contiguous spans of skeleton frames
+  -> Linear(411 -> 256)
+  -> randomly initialized 6-layer BERT
+  -> reconstruct masked coordinates/confidence and within-span velocity
+
+WORD-LEVEL EVALUATION
+held-out full sentence
+  -> unmasked Skeleton BERT hidden states at every layer
+  -> test-only gloss timestamps select frames belonging to each word token
+  -> average frames within token
+  -> average repeated tokens into one vector per word type
+  -> one sign RDM per Skeleton BERT layer
+
+TEXT REFERENCE
+same concept IDs and multilingual text forms
+  -> pretrained mBERT
+  -> one text RDM per mBERT layer
+  -> Spearman RSA + word-label permutation test
 ```
 
-The preferred initial training regime is self-supervised learning on sign motion, such as masked or future representation prediction. Translation supervision can serve as a comparison condition, although it weakens claims that semantic organization emerged without explicit spoken-language supervision.
+## Why this is self-supervised
 
-## Main analysis
+The input and target are both derived from the same skeleton sentence. The target for a
+masked span is its original normalized trajectory. The training process never loads the
+word-boundary file or the English translations. The result can therefore test semantic
+organization without lexical or semantic training labels, subject to appropriate
+kinematic controls.
 
-Use representational similarity analysis (RSA) to compare layer-wise sign-model representational dissimilarity matrices with semantic RDMs derived from English, Chinese, Spanish, and multilingual language models.
+## Model
 
-Primary questions:
+The default model uses:
 
-1. Do sign representations align with spoken-language semantic structure?
-2. Is any alignment language-specific or shared across languages?
-3. Does alignment increase across model depth while motion/pose alignment decreases?
-4. Does self-supervised sign learning show semantic alignment without gloss or translation supervision?
+- one flattened frame stream containing 25 body, 42 hand, and 70 face landmarks;
+- `(x, y, confidence)` for each landmark, or 411 input values per frame;
+- a learned linear skeleton projection;
+- a single learned mask embedding;
+- a 6-layer BERT initialized from scratch;
+- hidden size 256, 8 attention heads, and intermediate size 1024;
+- separate reconstruction slices only for balanced body/hands/face losses.
 
-## Longer-term extension
-
-Compare model RDMs with neural RDMs from native signers to test whether artificial sign-language representations resemble the organization of human language and visuomotor networks.
-
-## Important design risks
-
-- English translations can make apparent cross-modal semantic alignment partly circular.
-- Pose-only inputs may remove facial and mouth information that is linguistically meaningful.
-- Sentence length, motion energy, signer identity, and video context can confound semantic RSA.
-- Paired translations are not automatically a valid semantic stimulus set; evaluation items need controlled semantic contrasts or independent human similarity judgments.
-- Claims of modality-independent concepts require comparisons against visual/motor and low-level nuisance RDMs, not only language-model RDMs.
-
-## Working title
-
-**From mBERT to Sign Language Models: Testing Modality-Independent Semantic Spaces with RSA**
-
-## Selected first experiment
-
-### Dataset: How2Sign B-F-H 2D keypoint sentence clips
-
-Use the official frontal-view body-face-hands keypoint clips and the official
-train/validation/test split. How2Sign contains more than 80 hours of continuous ASL and
-provides sentence clips as well as manually re-aligned English translations. The English
-text is deliberately excluded from self-supervised pretraining and should only be joined
-later when constructing the semantic evaluation RDM.
-
-The dataset is research-only and licensed CC BY-NC 4.0. Download it from the
-[official How2Sign page](https://how2sign.github.io/index.html); raw data is intentionally
-not tracked by this repository.
-
-### Model: multi-stream masked-cluster Sign Transformer
-
-The implementation follows the central design of
-[SHuBERT (ACL 2025)](https://aclanthology.org/2025.acl-long.1397/): body, hands, and face
-form separate input streams, continuous spans are masked, and a Transformer predicts
-automatically clustered pose-and-motion targets for every stream. This is a compact,
-from-scratch research implementation rather than a copy of the authors' model.
-
-This model was selected because it:
-
-- learns from continuous signing without gloss or translation labels;
-- retains hands, face, and body as linguistically distinct streams;
-- supports sentence context instead of isolated sign classification;
-- exposes every Transformer layer for the proposed layer-wise RSA;
-- is substantially cheaper to train on keypoints than an RGB video backbone.
+The model calls `BertModel(inputs_embeds=...)`; it never tokenizes skeleton data and never
+loads mBERT weights. mBERT is a separate analysis-only reference model.
 
 ## Repository layout
 
 ```text
-configs/pretrain.json       main experiment configuration
+configs/pretrain.json           experiment configuration
+notebooks/colab_pretrain.ipynb  Colab GPU workflow
 src/sign_semantics/
-  prepare.py                OpenPose JSON -> normalized sentence NPZ
-  cluster.py                body/hands/face k-means pseudo-targets
-  model.py                  multi-stream masked Transformer
-  train.py                  pretraining and checkpointing
-  extract.py                layer-wise sentence embeddings for RSA
-tests/test_pipeline.py      synthetic end-to-end backward-pass test
+  prepare.py                    OpenPose JSON -> normalized sentence NPZ
+  data.py                       variable-length windowing, padding, frame mapping
+  masking.py                    contiguous temporal span masking
+  model.py                      randomly initialized Skeleton BERT
+  train.py                      masked trajectory pretraining
+  extract.py                    optional sentence-level representations
+  word_extract.py               test-only boundary pooling into word types
+  text_embed.py                 layer-wise mBERT concept representations
+  rsa.py                        RDMs, layer-wise RSA, permutation tests
+tests/test_pipeline.py          synthetic training and RSA tests
 ```
 
 ## Installation
-
-Python 3.10--3.13 is supported. A CUDA GPU is strongly recommended for the full model.
 
 ```bash
 python3 -m venv .venv
@@ -115,20 +86,15 @@ python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
 ```
 
-### Google Colab
+For Colab, use [notebooks/colab_pretrain.ipynb](notebooks/colab_pretrain.ipynb). Keep
+archives and checkpoints in Google Drive, but extract the many small JSON/NPZ files into
+the Colab VM under `/content`.
 
-Use [notebooks/colab_pretrain.ipynb](notebooks/colab_pretrain.ipynb) for GPU training.
-The notebook mounts Google Drive for archives and checkpoints, copies code and training
-data to the Colab VM for faster small-file access, resumes from `last.pt`, and exports
-layer-wise representations back to Drive. Before running it, either push this repository
-to GitHub and set `REPO_URL`, or upload the project folder to
-`MyDrive/sign_language_llm`.
+## 1. Prepare skeleton sentences
 
-## Data preparation
-
-Download each official keypoint split into a separate directory. Each sentence clip must
-ultimately be represented by one directory containing its frame-level OpenPose JSON files.
-Then run:
+Download the official frontal body-face-hands keypoint splits from the
+[How2Sign dataset page](https://how2sign.github.io/). The dataset is CC BY-NC 4.0 and is
+not redistributed by this repository.
 
 ```bash
 sign-prepare \
@@ -147,33 +113,16 @@ sign-prepare \
   --manifest data/processed/test.jsonl
 ```
 
-The converter selects the most confident detected signer, retains all 25 body, 42 hand,
-and 70 facial landmarks, and normalizes coordinates per frame using the neck and shoulder
-width. Missing detections remain confidence-weighted zeros.
+Each output NPZ contains `body`, `hands`, and `face` arrays. The manifest contains only a
+clip ID, file path, and number of frames. It contains no text or gloss.
 
-## Create self-supervised targets
-
-Fit the cluster vocabulary on the training split only:
-
-```bash
-sign-cluster \
-  --manifest data/processed/train.jsonl \
-  --output data/processed/cluster_centers.npz \
-  --n-clusters 500
-```
-
-Every cluster feature includes normalized position, frame-to-frame velocity, and OpenPose
-confidence. Validation and test frames must never be used to fit these centers.
-
-## Pretrain
-
-Review paths and batch size in `configs/pretrain.json`, then run:
+## 2. Pretrain Skeleton BERT
 
 ```bash
 sign-pretrain --config configs/pretrain.json
 ```
 
-Resume an interrupted run with:
+Resume after interruption:
 
 ```bash
 sign-pretrain \
@@ -181,39 +130,94 @@ sign-pretrain \
   --resume outputs/pretrain/last.pt
 ```
 
-The default model has 8 Transformer layers, hidden size 256, 8 attention heads, a maximum
-window of 256 frames, and masks approximately 50% of valid frames in contiguous spans.
-Checkpoints include the model, optimizer, scheduler, configuration, epoch, and best
-validation loss.
+The default objective masks about 40% of valid frames in spans averaging 20 frames. The
+loss averages body, hands, and face reconstruction so the 70 face landmarks do not
+overwhelm the smaller streams. A velocity term is applied to adjacent masked frames.
 
-## Export representations for RSA
+## 3. Extract contextual word representations
 
-```bash
-sign-extract \
-  --checkpoint outputs/pretrain/best.pt \
-  --manifest data/processed/test.jsonl \
-  --output outputs/representations/test_layers.npz
+Create a test-only JSONL boundary file. Frame indices refer to the original sentence clip;
+`end_frame` is exclusive.
+
+```json
+{"clip_id":"clip_001","gloss":"DOG","start_frame":42,"end_frame":68}
+{"clip_id":"clip_002","gloss":"DOG","start_frame":15,"end_frame":39}
+{"clip_id":"clip_003","gloss":"CAT","start_frame":70,"end_frame":91}
 ```
 
-The output contains sentence IDs and one mean-pooled matrix per Transformer layer. Build
-RDMs from these matrices and join them to translations by sentence ID outside the
-self-supervised training pipeline.
+The boundary file is never referenced by the training command.
 
-## Test
+```bash
+sign-extract-words \
+  --checkpoint outputs/pretrain/best.pt \
+  --manifest data/processed/test.jsonl \
+  --boundaries data/annotations/test_word_boundaries.jsonl \
+  --min-tokens 5 \
+  --output outputs/representations/sign_words.npz
+```
+
+For each BERT layer, the command encodes the complete sentence without masking, averages
+hidden frames within each word boundary, and averages repeated occurrences into one vector
+per gloss. Long sentences retain a mapping from sampled model frames to original frames.
+
+## 4. Create mBERT word references
+
+Create a CSV with the same concept IDs. `text` may contain a bare word or a standardized
+short context. Use the same contextual template across concepts.
+
+```csv
+id,text
+DOG,dog
+CAT,cat
+HOUSE,house
+```
+
+```bash
+sign-embed-text \
+  --concepts data/annotations/concepts_en.csv \
+  --model bert-base-multilingual-cased \
+  --output outputs/representations/mbert_en_words.npz
+```
+
+Repeat with Chinese, Spanish, or other translations while keeping the `id` column fixed.
+This command is analysis-only and downloads the selected text model from Hugging Face.
+
+## 5. Run layer-wise word RSA
+
+```bash
+sign-rsa \
+  --sign outputs/representations/sign_words.npz \
+  --text outputs/representations/mbert_en_words.npz \
+  --metric correlation \
+  --permutations 1000 \
+  --output outputs/rsa/sign_vs_mbert_en.csv
+```
+
+The tool aligns the two files by concept ID, constructs one RDM per layer, correlates RDM
+upper triangles with Spearman's rho, and estimates a two-sided word-label permutation
+p-value. The CSV contains every Skeleton-BERT-layer by mBERT-layer comparison.
+
+## Required scientific controls
+
+The implemented RSA tests alignment but does not by itself establish semantic causality.
+A confirmatory analysis should additionally compare or partial out:
+
+- raw normalized skeleton distance;
+- hand trajectory and velocity distance;
+- word duration;
+- signer identity;
+- an untrained Skeleton BERT;
+- independently split token averages where enough signers are available.
+
+Evidence for semantic emergence requires mBERT/human-semantic alignment that survives
+these kinematic and sampling controls.
+
+## Tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-The test constructs synthetic OpenPose frames, prepares and loads a sentence, assigns
-cluster targets, masks spans, performs a full forward/backward pass, and checks layer-wise
-embedding extraction.
-
-## Methodological constraints
-
-- Do not use English translations or glosses during the primary pretraining condition.
-- Fit preprocessing statistics and cluster centers using the training split only.
-- Report signer-disjoint results if a defensible signer-disjoint split can be constructed.
-- Include pose, motion energy, duration, signer identity, and text-length nuisance RDMs.
-- Treat the translation-supervised model as a positive-control condition, not evidence of
-  spontaneous cross-modal semantic emergence.
+The tests create synthetic OpenPose sentences, run masked Skeleton-BERT reconstruction and
+backpropagation, validate the original-frame mapping and word-boundary schema, and execute
+a small layer-wise RSA with permutation testing.

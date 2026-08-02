@@ -1,7 +1,6 @@
 """Self-supervised sign-language representation learning."""
 
-from .model import MultiStreamSignTransformer
+from .model import SkeletonBert, SkeletonBertConfig
 
-__all__ = ["MultiStreamSignTransformer"]
-__version__ = "0.1.0"
-
+__all__ = ["SkeletonBert", "SkeletonBertConfig"]
+__version__ = "0.2.0"

@@ -1,86 +1,79 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import torch
 from torch import nn
+from transformers import BertConfig, BertModel
 
 from .features import STREAM_JOINTS
 
 
 @dataclass(frozen=True)
-class ModelConfig:
-    d_model: int = 256
-    n_heads: int = 8
-    n_layers: int = 8
-    ff_multiplier: int = 4
-    dropout: float = 0.1
+class SkeletonBertConfig:
+    """Configuration for a small BERT trained from scratch on skeleton frames."""
+
+    hidden_size: int = 256
+    num_hidden_layers: int = 6
+    num_attention_heads: int = 8
+    intermediate_size: int = 1024
+    hidden_dropout_prob: float = 0.1
+    attention_probs_dropout_prob: float = 0.1
     max_frames: int = 256
 
-
-class StreamProjection(nn.Module):
-    def __init__(self, joints: int, d_model: int, dropout: float) -> None:
-        super().__init__()
-        input_dim = joints * 3
-        self.network = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        nn.init.normal_(self.mask_token, std=0.02)
-
-    def forward(self, stream: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
-        projected = self.network(stream.flatten(start_dim=2))
-        if mask is not None:
-            projected = torch.where(mask.unsqueeze(-1), self.mask_token, projected)
-        return projected
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
-class MultiStreamSignTransformer(nn.Module):
-    """SHuBERT-style body/hands/face masked-cluster Transformer.
+class SkeletonBert(nn.Module):
+    """A single-stream temporal BERT with masked skeleton reconstruction.
 
-    The implementation is intentionally compact and exposes every Transformer layer,
-    making layer-wise sentence representations available for RSA.
+    BERT is randomly initialized. It receives continuous frame embeddings through
+    ``inputs_embeds`` and never receives text, glosses, or pretrained language weights.
     """
 
-    def __init__(self, config: ModelConfig, cluster_sizes: dict[str, int]) -> None:
+    def __init__(self, config: SkeletonBertConfig) -> None:
         super().__init__()
-        if config.d_model % config.n_heads:
-            raise ValueError("d_model must be divisible by n_heads")
+        if config.hidden_size % config.num_attention_heads:
+            raise ValueError("hidden_size must be divisible by num_attention_heads")
         self.config = config
-        self.projections = nn.ModuleDict(
-            {
-                name: StreamProjection(joints, config.d_model, config.dropout)
-                for name, joints in STREAM_JOINTS.items()
-            }
+        self.stream_slices: dict[str, slice] = {}
+        offset = 0
+        for name, joints in STREAM_JOINTS.items():
+            width = joints * 3
+            self.stream_slices[name] = slice(offset, offset + width)
+            offset += width
+        self.input_dim = offset
+
+        self.input_norm = nn.LayerNorm(self.input_dim)
+        self.input_projection = nn.Linear(self.input_dim, config.hidden_size)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
+        nn.init.normal_(self.mask_token, std=0.02)
+
+        bert_config = BertConfig(
+            vocab_size=1,
+            hidden_size=config.hidden_size,
+            num_hidden_layers=config.num_hidden_layers,
+            num_attention_heads=config.num_attention_heads,
+            intermediate_size=config.intermediate_size,
+            hidden_dropout_prob=config.hidden_dropout_prob,
+            attention_probs_dropout_prob=config.attention_probs_dropout_prob,
+            max_position_embeddings=config.max_frames,
+            type_vocab_size=1,
+            pad_token_id=0,
         )
-        self.fusion = nn.Sequential(
-            nn.Linear(config.d_model * len(STREAM_JOINTS), config.d_model),
-            nn.LayerNorm(config.d_model),
-            nn.Dropout(config.dropout),
-        )
-        self.position = nn.Parameter(torch.zeros(1, config.max_frames, config.d_model))
-        nn.init.trunc_normal_(self.position, std=0.02)
-        self.layers = nn.ModuleList(
-            [
-                nn.TransformerEncoderLayer(
-                    d_model=config.d_model,
-                    nhead=config.n_heads,
-                    dim_feedforward=config.d_model * config.ff_multiplier,
-                    dropout=config.dropout,
-                    activation="gelu",
-                    batch_first=True,
-                    norm_first=True,
-                )
-                for _ in range(config.n_layers)
-            ]
-        )
-        self.final_norm = nn.LayerNorm(config.d_model)
-        self.heads = nn.ModuleDict(
-            {name: nn.Linear(config.d_model, cluster_sizes[name]) for name in STREAM_JOINTS}
-        )
+        self.bert = BertModel(bert_config, add_pooling_layer=False)
+        self.reconstruction_head = nn.Linear(config.hidden_size, self.input_dim)
+
+    def flatten_streams(self, streams: dict[str, torch.Tensor]) -> torch.Tensor:
+        return torch.cat([streams[name].flatten(start_dim=2) for name in STREAM_JOINTS], dim=-1)
+
+    def split_reconstruction(self, reconstruction: torch.Tensor) -> dict[str, torch.Tensor]:
+        result: dict[str, torch.Tensor] = {}
+        for name, joints in STREAM_JOINTS.items():
+            values = reconstruction[..., self.stream_slices[name]]
+            result[name] = values.unflatten(-1, (joints, 3))
+        return result
 
     def encode(
         self,
@@ -89,19 +82,25 @@ class MultiStreamSignTransformer(nn.Module):
         mask: torch.Tensor | None = None,
         return_all_layers: bool = False,
     ) -> torch.Tensor | list[torch.Tensor]:
-        time = valid.shape[1]
-        if time > self.config.max_frames:
-            raise ValueError(f"Sequence length {time} exceeds max_frames={self.config.max_frames}")
-        projected = [self.projections[name](streams[name], mask) for name in STREAM_JOINTS]
-        hidden = self.fusion(torch.cat(projected, dim=-1)) + self.position[:, :time]
-        states: list[torch.Tensor] = []
-        padding = ~valid
-        for layer in self.layers:
-            hidden = layer(hidden, src_key_padding_mask=padding)
-            if return_all_layers:
-                states.append(self.final_norm(hidden))
-        hidden = self.final_norm(hidden)
-        return states if return_all_layers else hidden
+        frames = self.flatten_streams(streams)
+        if frames.shape[1] > self.config.max_frames:
+            raise ValueError(
+                f"Sequence length {frames.shape[1]} exceeds max_frames={self.config.max_frames}"
+            )
+        embeddings = self.input_projection(self.input_norm(frames))
+        if mask is not None:
+            embeddings = torch.where(mask.unsqueeze(-1), self.mask_token, embeddings)
+        outputs = self.bert(
+            inputs_embeds=embeddings,
+            attention_mask=valid.to(dtype=torch.long),
+            output_hidden_states=return_all_layers,
+            return_dict=True,
+        )
+        if return_all_layers:
+            assert outputs.hidden_states is not None
+            # The first state is the embedding output; RSA uses encoder-layer outputs only.
+            return list(outputs.hidden_states[1:])
+        return outputs.last_hidden_state
 
     def forward(
         self,
@@ -111,10 +110,9 @@ class MultiStreamSignTransformer(nn.Module):
     ) -> dict[str, torch.Tensor]:
         hidden = self.encode(streams, valid, mask)
         assert isinstance(hidden, torch.Tensor)
-        return {name: self.heads[name](hidden) for name in STREAM_JOINTS}
+        return self.split_reconstruction(self.reconstruction_head(hidden))
 
 
 def masked_mean(hidden: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     weights = valid.unsqueeze(-1).to(hidden.dtype)
     return (hidden * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
-

@@ -4,7 +4,6 @@ import argparse
 import math
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Iterator
 
 import torch
 import torch.nn.functional as F
@@ -14,8 +13,7 @@ from torch.utils.data import DataLoader
 from .data import How2SignPoseDataset
 from .features import STREAM_JOINTS
 from .masking import sample_span_mask
-from .model import ModelConfig, MultiStreamSignTransformer
-from .targets import ClusterTargeter
+from .model import SkeletonBert, SkeletonBertConfig
 from .utils import atomic_torch_save, choose_device, load_json, seed_everything
 
 
@@ -25,14 +23,32 @@ def move_batch(batch: dict, device: torch.device) -> tuple[dict[str, torch.Tenso
     return streams, valid
 
 
-def masked_prediction_loss(
-    logits: dict[str, torch.Tensor],
+def masked_reconstruction_loss(
+    predictions: dict[str, torch.Tensor],
     targets: dict[str, torch.Tensor],
     supervised: torch.Tensor,
+    velocity_weight: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    """Balanced masked-frame coordinate and within-span velocity reconstruction."""
     if not supervised.any():
-        raise ValueError("No frames selected for masked prediction")
-    losses = {name: F.cross_entropy(logits[name][supervised], targets[name][supervised]) for name in logits}
+        raise ValueError("No frames selected for masked reconstruction")
+    losses: dict[str, torch.Tensor] = {}
+    for name in STREAM_JOINTS:
+        frame_error = F.smooth_l1_loss(predictions[name], targets[name], reduction="none")
+        coordinate_loss = frame_error.mean(dim=(-1, -2))[supervised].mean()
+
+        predicted_velocity = torch.diff(predictions[name][..., :2], dim=1)
+        target_velocity = torch.diff(targets[name][..., :2], dim=1)
+        velocity_frames = supervised[:, 1:] & supervised[:, :-1]
+        if velocity_frames.any():
+            velocity_error = F.smooth_l1_loss(
+                predicted_velocity, target_velocity, reduction="none"
+            ).mean(dim=(-1, -2))
+            velocity_loss = velocity_error[velocity_frames].mean()
+        else:
+            velocity_loss = coordinate_loss.new_zeros(())
+        losses[name] = coordinate_loss + velocity_weight * velocity_loss
+
     total = torch.stack(list(losses.values())).mean()
     return total, {name: float(value.detach()) for name, value in losses.items()}
 
@@ -51,12 +67,12 @@ def cosine_schedule(
 
 @torch.no_grad()
 def validate(
-    model: MultiStreamSignTransformer,
+    model: SkeletonBert,
     loader: DataLoader,
-    targeter: ClusterTargeter,
     device: torch.device,
     mask_probability: float,
     span_length: int,
+    velocity_weight: float,
 ) -> float:
     model.eval()
     losses: list[float] = []
@@ -64,16 +80,12 @@ def validate(
     for batch in loader:
         streams, valid = move_batch(batch, device)
         mask = sample_span_mask(valid, mask_probability, span_length, generator)
-        targets = targeter.assign(streams)
-        logits = model(streams, valid, mask)
-        loss, _ = masked_prediction_loss(logits, targets, mask & valid)
+        predictions = model(streams, valid, mask)
+        loss, _ = masked_reconstruction_loss(
+            predictions, streams, mask & valid, velocity_weight
+        )
         losses.append(float(loss))
     return sum(losses) / max(len(losses), 1)
-
-
-def infinite(loader: DataLoader) -> Iterator[dict]:
-    while True:
-        yield from loader
 
 
 def run_training(config_path: Path, resume: Path | None = None) -> None:
@@ -89,31 +101,33 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
     val_data = How2SignPoseDataset(
         data_config["val_manifest"], data_config["max_frames"], training=False
     )
+    train_config = config["training"]
     pin_memory = device.type == "cuda"
     train_loader = DataLoader(
         train_data,
-        batch_size=config["training"]["batch_size"],
+        batch_size=train_config["batch_size"],
         shuffle=True,
         num_workers=data_config["num_workers"],
         pin_memory=pin_memory,
-        drop_last=True,
+        drop_last=False,
     )
     val_loader = DataLoader(
         val_data,
-        batch_size=config["training"]["batch_size"],
+        batch_size=train_config["batch_size"],
         shuffle=False,
         num_workers=data_config["num_workers"],
         pin_memory=pin_memory,
     )
 
-    targeter = ClusterTargeter(data_config["centers_path"], device)
-    model_config = ModelConfig(**config["model"])
-    model = MultiStreamSignTransformer(model_config, targeter.cluster_sizes).to(device)
-    train_config = config["training"]
+    model_config = SkeletonBertConfig(**config["model"])
+    model = SkeletonBert(model_config).to(device)
     optimizer = AdamW(
-        model.parameters(), lr=train_config["learning_rate"], weight_decay=train_config["weight_decay"]
+        model.parameters(),
+        lr=train_config["learning_rate"],
+        weight_decay=train_config["weight_decay"],
     )
-    steps_per_epoch = max(1, len(train_loader) // train_config["gradient_accumulation"])
+    accumulation = int(train_config["gradient_accumulation"])
+    steps_per_epoch = max(1, math.ceil(len(train_loader) / accumulation))
     total_steps = steps_per_epoch * train_config["epochs"]
     scheduler = cosine_schedule(optimizer, train_config["warmup_steps"], total_steps)
     amp_enabled = bool(train_config["amp"] and device.type == "cuda")
@@ -134,28 +148,40 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
 
     output_dir = Path(train_config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
-    accumulation = int(train_config["gradient_accumulation"])
     mask_config = config["masking"]
 
     for epoch in range(start_epoch, train_config["epochs"]):
         model.train()
         optimizer.zero_grad(set_to_none=True)
         running = 0.0
+        logged_batches = 0
         for batch_index, batch in enumerate(train_loader):
             streams, valid = move_batch(batch, device)
             mask = sample_span_mask(
                 valid, mask_config["mask_probability"], mask_config["mean_span_length"]
             )
-            targets = targeter.assign(streams)
-            autocast = torch.autocast(device_type="cuda", dtype=torch.float16) if amp_enabled else nullcontext()
+            autocast = (
+                torch.autocast(device_type="cuda", dtype=torch.float16)
+                if amp_enabled
+                else nullcontext()
+            )
             with autocast:
-                logits = model(streams, valid, mask)
-                loss, stream_losses = masked_prediction_loss(logits, targets, mask & valid)
-                scaled_loss = loss / accumulation
+                predictions = model(streams, valid, mask)
+                loss, stream_losses = masked_reconstruction_loss(
+                    predictions,
+                    streams,
+                    mask & valid,
+                    mask_config["velocity_weight"],
+                )
+                group_start = (batch_index // accumulation) * accumulation
+                group_size = min(accumulation, len(train_loader) - group_start)
+                scaled_loss = loss / group_size
             scaler.scale(scaled_loss).backward()
             running += float(loss.detach())
+            logged_batches += 1
 
-            if (batch_index + 1) % accumulation == 0:
+            last_batch = batch_index + 1 == len(train_loader)
+            if (batch_index + 1) % accumulation == 0 or last_batch:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), train_config["grad_clip"])
                 scaler.step(optimizer)
@@ -164,21 +190,24 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
                 scheduler.step()
                 global_step += 1
                 if global_step % train_config["log_every"] == 0:
-                    mean = running / train_config["log_every"]
-                    details = " ".join(f"{key}={value:.3f}" for key, value in stream_losses.items())
+                    details = " ".join(
+                        f"{key}={value:.4f}" for key, value in stream_losses.items()
+                    )
                     print(
-                        f"epoch={epoch + 1} step={global_step} loss={mean:.4f} "
+                        f"epoch={epoch + 1} step={global_step} "
+                        f"loss={running / max(logged_batches, 1):.4f} "
                         f"lr={scheduler.get_last_lr()[0]:.2e} {details}"
                     )
                     running = 0.0
+                    logged_batches = 0
 
         val_loss = validate(
             model,
             val_loader,
-            targeter,
             device,
             mask_config["mask_probability"],
             mask_config["mean_span_length"],
+            mask_config["velocity_weight"],
         )
         print(f"epoch={epoch + 1} val_loss={val_loss:.4f}")
         payload = {
@@ -188,8 +217,7 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
             "epoch": epoch,
             "global_step": global_step,
             "best_val": min(best_val, val_loss),
-            "model_config": config["model"],
-            "cluster_sizes": targeter.cluster_sizes,
+            "model_config": model_config.to_dict(),
         }
         atomic_torch_save(payload, output_dir / "last.pt")
         if val_loss < best_val:
@@ -200,7 +228,7 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Pretrain the sign-language Transformer")
+    parser = argparse.ArgumentParser(description="Pretrain BERT on masked skeleton trajectories")
     parser.add_argument("--config", type=Path, default=Path("configs/pretrain.json"))
     parser.add_argument("--resume", type=Path)
     return parser
@@ -213,4 +241,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

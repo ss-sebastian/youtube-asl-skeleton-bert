@@ -4,14 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sign-semantics"
-version = "0.1.0"
+version = "0.2.0"
 description = "Self-supervised sentence-level sign-language representation learning for RSA"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [
   "numpy>=1.26",
-  "scikit-learn>=1.4",
+  "scipy>=1.12",
   "torch>=2.2",
+  "transformers>=5.0,<6",
   "tqdm>=4.66",
 ]
 
@@ -20,9 +21,11 @@ dev = ["pytest>=8.0", "ruff>=0.5"]
 
 [project.scripts]
 sign-prepare = "sign_semantics.prepare:main"
-sign-cluster = "sign_semantics.cluster:main"
 sign-pretrain = "sign_semantics.train:main"
 sign-extract = "sign_semantics.extract:main"
+sign-extract-words = "sign_semantics.word_extract:main"
+sign-embed-text = "sign_semantics.text_embed:main"
+sign-rsa = "sign_semantics.rsa:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -33,4 +36,3 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
-

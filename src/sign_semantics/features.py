@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import numpy as np
-import torch
-
 STREAM_JOINTS = {"body": 25, "hands": 42, "face": 70}
 
 
@@ -37,20 +35,3 @@ def normalize_openpose(
         result[~np.isfinite(result)] = 0
         normalized.append(result.astype(np.float32))
     return normalized[0], normalized[1], normalized[2]
-
-
-def cluster_features_numpy(stream: np.ndarray) -> np.ndarray:
-    """Build per-frame pose-and-motion features for offline k-means."""
-    xy = stream[..., :2]
-    velocity = np.diff(xy, axis=0, prepend=xy[:1])
-    confidence = stream[..., 2:3]
-    return np.concatenate([xy, velocity, confidence], axis=-1).reshape(stream.shape[0], -1)
-
-
-def cluster_features_torch(stream: torch.Tensor) -> torch.Tensor:
-    """Torch equivalent of :func:`cluster_features_numpy` for batched sequences."""
-    xy = stream[..., :2]
-    velocity = torch.diff(xy, dim=1, prepend=xy[:, :1])
-    confidence = stream[..., 2:3]
-    return torch.cat([xy, velocity, confidence], dim=-1).flatten(start_dim=2)
-

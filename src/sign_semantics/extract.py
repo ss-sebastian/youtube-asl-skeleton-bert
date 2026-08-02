@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from .data import How2SignPoseDataset
 from .features import STREAM_JOINTS
-from .model import ModelConfig, MultiStreamSignTransformer, masked_mean
+from .model import SkeletonBert, SkeletonBertConfig, masked_mean
 from .utils import choose_device
 
 
@@ -24,9 +24,7 @@ def extract_representations(
 ) -> None:
     device = choose_device()
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model = MultiStreamSignTransformer(
-        ModelConfig(**checkpoint["model_config"]), checkpoint["cluster_sizes"]
-    ).to(device)
+    model = SkeletonBert(SkeletonBertConfig(**checkpoint["model_config"])).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
 

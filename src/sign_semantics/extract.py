@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .data import How2SignPoseDataset
+from .data import YouTubeASLPoseDataset
 from .features import STREAM_JOINTS
 from .model import SkeletonBert, SkeletonBertConfig, masked_mean
 from .utils import choose_device
@@ -17,7 +17,8 @@ from .utils import choose_device
 @torch.no_grad()
 def extract_representations(
     checkpoint_path: Path,
-    manifest: Path,
+    archive: Path,
+    annotations: Path,
     output: Path,
     max_frames: int,
     batch_size: int,
@@ -28,10 +29,14 @@ def extract_representations(
     model.load_state_dict(checkpoint["model"])
     model.eval()
 
-    dataset = How2SignPoseDataset(manifest, max_frames=max_frames, training=False)
+    dataset = YouTubeASLPoseDataset(
+        archive, annotations, max_frames=max_frames, training=False
+    )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     identifiers: list[str] = []
-    layer_batches: list[list[np.ndarray]] = [[] for _ in range(model.config.n_layers)]
+    layer_batches: list[list[np.ndarray]] = [
+        [] for _ in range(model.config.num_hidden_layers)
+    ]
     for batch in tqdm(loader, desc="Extracting sentence representations"):
         streams = {name: batch[name].to(device) for name in STREAM_JOINTS}
         valid = batch["valid"].to(device)
@@ -53,7 +58,8 @@ def extract_representations(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Export layer-wise sentence embeddings for RSA")
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--archive", type=Path, required=True)
+    parser.add_argument("--annotations", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-frames", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -63,7 +69,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     extract_representations(
-        args.checkpoint, args.manifest, args.output, args.max_frames, args.batch_size
+        args.checkpoint,
+        args.archive,
+        args.annotations,
+        args.output,
+        args.max_frames,
+        args.batch_size,
     )
 
 

@@ -1,10 +1,11 @@
 {
   "seed": 42,
   "data": {
-    "train_manifest": "data/processed/train.jsonl",
-    "val_manifest": "data/processed/val.jsonl",
+    "train_archive": "data/raw/raw_keypoints_1.zip",
+    "val_archive": "data/raw/raw_keypoints_1.zip",
+    "train_annotations": "data/raw/YT.translations.train.json",
+    "val_annotations": "data/raw/YT.translations.dev.json",
     "max_frames": 256,
-    "min_frames": 12,
     "num_workers": 4
   },
   "model": {
@@ -24,10 +25,11 @@
   "training": {
     "output_dir": "outputs/pretrain",
     "batch_size": 16,
-    "epochs": 100,
+    "epochs": 1,
     "learning_rate": 0.0003,
     "weight_decay": 0.01,
-    "warmup_steps": 2000,
+    "warmup_steps": 1000,
+    "scheduler_total_steps": 25000,
     "grad_clip": 1.0,
     "gradient_accumulation": 1,
     "amp": true,

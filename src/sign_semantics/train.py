@@ -10,17 +10,23 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
-from .data import How2SignPoseDataset
+from .data import YouTubeASLPoseDataset
 from .features import STREAM_JOINTS
 from .masking import sample_span_mask
 from .model import SkeletonBert, SkeletonBertConfig
 from .utils import atomic_torch_save, choose_device, load_json, seed_everything
 
 
-def move_batch(batch: dict, device: torch.device) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+def move_batch(
+    batch: dict, device: torch.device
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor]:
     streams = {name: batch[name].to(device, non_blocking=True) for name in STREAM_JOINTS}
+    observed = {
+        name: batch[f"{name}_observed"].to(device, non_blocking=True)
+        for name in STREAM_JOINTS
+    }
     valid = batch["valid"].to(device, non_blocking=True)
-    return streams, valid
+    return streams, observed, valid
 
 
 def masked_reconstruction_loss(
@@ -28,6 +34,7 @@ def masked_reconstruction_loss(
     targets: dict[str, torch.Tensor],
     supervised: torch.Tensor,
     velocity_weight: float,
+    observed: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Balanced masked-frame coordinate and within-span velocity reconstruction."""
     if not supervised.any():
@@ -35,16 +42,31 @@ def masked_reconstruction_loss(
     losses: dict[str, torch.Tensor] = {}
     for name in STREAM_JOINTS:
         frame_error = F.smooth_l1_loss(predictions[name], targets[name], reduction="none")
-        coordinate_loss = frame_error.mean(dim=(-1, -2))[supervised].mean()
+        joint_seen = (
+            observed[name]
+            if observed is not None
+            else torch.ones_like(targets[name][..., 0], dtype=torch.bool)
+        )
+        coordinate_mask = supervised.unsqueeze(-1) & joint_seen
+        if coordinate_mask.any():
+            coordinate_loss = frame_error[
+                coordinate_mask.unsqueeze(-1).expand_as(frame_error)
+            ].mean()
+        else:
+            coordinate_loss = frame_error.new_zeros(())
 
         predicted_velocity = torch.diff(predictions[name][..., :2], dim=1)
         target_velocity = torch.diff(targets[name][..., :2], dim=1)
-        velocity_frames = supervised[:, 1:] & supervised[:, :-1]
-        if velocity_frames.any():
+        velocity_frames = (supervised[:, 1:] & supervised[:, :-1]).unsqueeze(-1)
+        velocity_seen = joint_seen[:, 1:] & joint_seen[:, :-1]
+        velocity_mask = velocity_frames & velocity_seen
+        if velocity_mask.any():
             velocity_error = F.smooth_l1_loss(
                 predicted_velocity, target_velocity, reduction="none"
-            ).mean(dim=(-1, -2))
-            velocity_loss = velocity_error[velocity_frames].mean()
+            )
+            velocity_loss = velocity_error[
+                velocity_mask.unsqueeze(-1).expand_as(velocity_error)
+            ].mean()
         else:
             velocity_loss = coordinate_loss.new_zeros(())
         losses[name] = coordinate_loss + velocity_weight * velocity_loss
@@ -78,11 +100,11 @@ def validate(
     losses: list[float] = []
     generator = torch.Generator().manual_seed(0)
     for batch in loader:
-        streams, valid = move_batch(batch, device)
+        streams, observed, valid = move_batch(batch, device)
         mask = sample_span_mask(valid, mask_probability, span_length, generator)
         predictions = model(streams, valid, mask)
         loss, _ = masked_reconstruction_loss(
-            predictions, streams, mask & valid, velocity_weight
+            predictions, streams, mask & valid, velocity_weight, observed
         )
         losses.append(float(loss))
     return sum(losses) / max(len(losses), 1)
@@ -95,11 +117,19 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
     print(f"Using device: {device}")
 
     data_config = config["data"]
-    train_data = How2SignPoseDataset(
-        data_config["train_manifest"], data_config["max_frames"], training=True
+    train_data = YouTubeASLPoseDataset(
+        archive=data_config["train_archive"],
+        annotations=data_config["train_annotations"],
+        max_frames=data_config["max_frames"],
+        training=True,
+        limit_clips=data_config.get("limit_train_clips"),
     )
-    val_data = How2SignPoseDataset(
-        data_config["val_manifest"], data_config["max_frames"], training=False
+    val_data = YouTubeASLPoseDataset(
+        archive=data_config.get("val_archive", data_config["train_archive"]),
+        annotations=data_config["val_annotations"],
+        max_frames=data_config["max_frames"],
+        training=False,
+        limit_clips=data_config.get("limit_val_clips"),
     )
     train_config = config["training"]
     pin_memory = device.type == "cuda"
@@ -128,7 +158,9 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
     )
     accumulation = int(train_config["gradient_accumulation"])
     steps_per_epoch = max(1, math.ceil(len(train_loader) / accumulation))
-    total_steps = steps_per_epoch * train_config["epochs"]
+    total_steps = int(
+        train_config.get("scheduler_total_steps", steps_per_epoch * train_config["epochs"])
+    )
     scheduler = cosine_schedule(optimizer, train_config["warmup_steps"], total_steps)
     amp_enabled = bool(train_config["amp"] and device.type == "cuda")
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
@@ -156,7 +188,7 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         running = 0.0
         logged_batches = 0
         for batch_index, batch in enumerate(train_loader):
-            streams, valid = move_batch(batch, device)
+            streams, observed, valid = move_batch(batch, device)
             mask = sample_span_mask(
                 valid, mask_config["mask_probability"], mask_config["mean_span_length"]
             )
@@ -172,6 +204,7 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
                     streams,
                     mask & valid,
                     mask_config["velocity_weight"],
+                    observed,
                 )
                 group_start = (batch_index // accumulation) * accumulation
                 group_size = min(accumulation, len(train_loader) - group_start)

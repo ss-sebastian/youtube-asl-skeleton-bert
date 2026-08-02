@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sign-semantics"
-version = "0.2.0"
-description = "Self-supervised sentence-level sign-language representation learning for RSA"
+version = "0.3.0"
+description = "Self-supervised Skeleton BERT pretraining on YouTube-ASL sentence trajectories"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [
@@ -14,13 +14,13 @@ dependencies = [
   "torch>=2.2",
   "transformers>=5.0,<6",
   "tqdm>=4.66",
+  "remotezip>=0.12",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.5"]
 
 [project.scripts]
-sign-prepare = "sign_semantics.prepare:main"
 sign-pretrain = "sign_semantics.train:main"
 sign-extract = "sign_semantics.extract:main"
 sign-extract-words = "sign_semantics.word_extract:main"

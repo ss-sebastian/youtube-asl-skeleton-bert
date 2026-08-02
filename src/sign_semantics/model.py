@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from transformers import BertConfig, BertModel
 
-from .features import STREAM_JOINTS
+from .features import COORDINATE_DIM, STREAM_JOINTS
 
 
 @dataclass(frozen=True)
@@ -40,7 +40,7 @@ class SkeletonBert(nn.Module):
         self.stream_slices: dict[str, slice] = {}
         offset = 0
         for name, joints in STREAM_JOINTS.items():
-            width = joints * 3
+            width = joints * COORDINATE_DIM
             self.stream_slices[name] = slice(offset, offset + width)
             offset += width
         self.input_dim = offset
@@ -72,7 +72,7 @@ class SkeletonBert(nn.Module):
         result: dict[str, torch.Tensor] = {}
         for name, joints in STREAM_JOINTS.items():
             values = reconstruction[..., self.stream_slices[name]]
-            result[name] = values.unflatten(-1, (joints, 3))
+            result[name] = values.unflatten(-1, (joints, COORDINATE_DIM))
         return result
 
     def encode(

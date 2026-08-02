@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .data import How2SignPoseDataset
+from .data import YouTubeASLPoseDataset
 from .features import STREAM_JOINTS
 from .model import SkeletonBert, SkeletonBertConfig
 from .utils import choose_device, read_jsonl
@@ -37,7 +37,8 @@ def load_boundaries(path: Path) -> dict[str, list[dict]]:
 @torch.no_grad()
 def extract_word_representations(
     checkpoint_path: Path,
-    manifest: Path,
+    archive: Path,
+    annotations: Path,
     boundaries_path: Path,
     output: Path,
     max_frames: int,
@@ -51,7 +52,9 @@ def extract_word_representations(
     model.eval()
 
     boundaries = load_boundaries(boundaries_path)
-    dataset = How2SignPoseDataset(manifest, max_frames=max_frames, training=False)
+    dataset = YouTubeASLPoseDataset(
+        archive, annotations, max_frames=max_frames, training=False
+    )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
     token_states: dict[str, list[list[np.ndarray]]] = defaultdict(
         lambda: [[] for _ in range(model.config.num_hidden_layers)]
@@ -107,7 +110,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Pool BERT frames inside test-only word boundaries"
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--archive", type=Path, required=True)
+    parser.add_argument("--annotations", type=Path, required=True)
     parser.add_argument("--boundaries", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-frames", type=int, default=256)
@@ -120,7 +124,8 @@ def main() -> None:
     args = build_parser().parse_args()
     extract_word_representations(
         args.checkpoint,
-        args.manifest,
+        args.archive,
+        args.annotations,
         args.boundaries,
         args.output,
         args.max_frames,
@@ -131,4 +136,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

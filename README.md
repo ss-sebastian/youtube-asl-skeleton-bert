@@ -49,8 +49,10 @@ GPU runtime, and run the cells. The notebook:
    the selected Drive account, and checks a persistent account marker;
 2. clones this GitHub repository into `/content`;
 3. installs aria2 and downloads the small official train/dev annotations;
-4. downloads one keypoint shard at a time with 16-connection resumable aria2;
-5. trains directly from that ZIP;
+4. downloads with 16-connection resumable aria2 and, while shard N trains,
+   prefetches shard N+1 in the background;
+5. trains directly from the current ZIP while keeping at most two shards on
+   local disk;
 6. saves `last.pt`, `best.pt`, `metrics.jsonl`, and `metrics.csv` locally, then
    copies and size-verifies them in Drive after every shard;
 7. updates `completed_shards.json` in Drive and only then removes the local
@@ -75,6 +77,12 @@ user to choose the intended account in its authorisation dialog because
 unavailable, save the newest fallback resume ZIP and upload it later as
 `/content/youtube_asl_full_resume.zip`. Dataset shards remain temporary and are
 never copied to Drive.
+
+No verified public mirror of the keypoint release is currently available. The
+prefetch pipeline reduces end-to-end wall time by overlapping the next roughly
+35 GB download with current-shard training; it does not increase the official
+server's raw bandwidth. With roughly 165 GB free, two simultaneous shards plus
+checkpoints fit safely while preserving a 45 GB free-space guard.
 
 The committed Colab notebook now defaults to `MODE = "full"` after the pilot was
 successfully completed. For a fresh environment, set `MODE = "pilot"` to

@@ -33,27 +33,29 @@ The project uses the official
 - frame-wise MediaPipe pose, hands, and face landmarks;
 - CC BY 4.0.
 
-The data is not committed to GitHub and the Colab workflow does not put it in
-Google Drive. A shard stays temporarily under `/content`, is read directly from
-the ZIP without extraction, and is deleted after its checkpoint and resume
-bundle are verified. Roughly 165 GB of free Colab disk is enough for this
-one-shard-at-a-time workflow, but not for all ten roughly 35 GB shards at once.
+The data is not committed to GitHub and the Colab workflow never puts raw data
+in Google Drive. A shard stays temporarily under `/content`, is read directly
+from the ZIP without extraction, and is deleted only after its checkpoint,
+metrics, and completion state are verified in Drive (or in the fallback resume
+bundle). Roughly 165 GB of free Colab disk is enough for this one-shard-at-a-time
+workflow, but not for all ten roughly 35 GB shards at once.
 
 ## Colab training
 
 Open [`notebooks/colab_pretrain.ipynb`](notebooks/colab_pretrain.ipynb), select a
 GPU runtime, and run the cells. The notebook:
 
-1. verifies the GPU and reports local Colab disk space without mounting Drive;
+1. verifies the GPU, requires distinct Colab and Drive account emails, mounts
+   the selected Drive account, and checks a persistent account marker;
 2. clones this GitHub repository into `/content`;
 3. installs aria2 and downloads the small official train/dev annotations;
 4. downloads one keypoint shard at a time with 16-connection resumable aria2;
 5. trains directly from that ZIP;
-6. saves `last.pt`, `best.pt`, `metrics.jsonl`, and `metrics.csv` locally and
-   downloads a compact resume bundle after every shard;
-7. removes the local shard after successful training and prints disk usage;
-8. optionally mounts a separately authorised Drive account after training to
-   copy the final model bundle only.
+6. saves `last.pt`, `best.pt`, `metrics.jsonl`, and `metrics.csv` locally, then
+   copies and size-verifies them in Drive after every shard;
+7. updates `completed_shards.json` in Drive and only then removes the local
+   shard and prints disk usage;
+8. falls back to a browser-downloaded resume bundle if Drive mounting fails.
 
 During training, a live progress bar and flushed `training_progress` JSON records
 report processed clips, percentage, throughput, loss, optimizer steps, and ETA.
@@ -64,19 +66,21 @@ PCK@0.2; elapsed time; throughput; and peak GPU memory. The loader uses fast
 JSON decoding, reads only the selected 37 facial landmarks, and prefetches
 batches with persistent workers to keep the GPU supplied.
 
-The notebook does not require Drive before training. It downloads a compact
-resume ZIP after every completed shard. Save the newest ZIP.
-Before the next session, upload it to Colab as
-`/content/youtube_asl_full_resume.zip`; the notebook restores the completion
-state, checkpoints, and metric history automatically, skips finished shards,
-and continues with the next shard. Dataset shards remain temporary and are
+At startup the notebook restores the latest completion state, checkpoints, and
+metric history from Drive. The Drive account can differ from the account that
+supplies the Colab runtime: the notebook rejects equal email entries and checks
+a marker under `MyDrive/sign_semantics_youtube_asl/`. Google still requires the
+user to choose the intended account in its authorisation dialog because
+`drive.mount()` does not expose the mounted email to Python. If Drive is
+unavailable, save the newest fallback resume ZIP and upload it later as
+`/content/youtube_asl_full_resume.zip`. Dataset shards remain temporary and are
 never copied to Drive.
 
 The committed Colab notebook now defaults to `MODE = "full"` after the pilot was
 successfully completed. For a fresh environment, set `MODE = "pilot"` to
 verify GPU, data, and loss before returning to full mode. If Colab disconnects
-between shards, rerunning the notebook reads the uploaded resume bundle and
-continues with the next shard.
+between shards, rerunning the notebook restores Drive state (or the uploaded
+fallback resume bundle) and continues with the next shard.
 
 Ten 37 GB downloads plus training are not expected to finish in one free Colab
 session. The notebook is intentionally resumable across sessions.

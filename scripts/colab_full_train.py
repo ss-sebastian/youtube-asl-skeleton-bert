@@ -71,17 +71,42 @@ def download(target: Path, identifier: str) -> None:
     subprocess.run(command, check=True)
 
 
+def sync_update_to_drive(
+    state_path: Path, checkpoint_root: Path, drive_run_root: Path
+) -> None:
+    drive_checkpoints = drive_run_root / "checkpoints"
+    drive_checkpoints.mkdir(parents=True, exist_ok=True)
+    sources = []
+    for name in ("last.pt", "best.pt", "metrics.jsonl", "metrics.csv"):
+        source = checkpoint_root / name
+        if source.exists():
+            sources.append((source, drive_checkpoints / name))
+    sources.append((state_path, drive_run_root / state_path.name))
+    if not any(source.name == "last.pt" for source, _ in sources):
+        raise RuntimeError("Refusing to sync: last.pt is missing")
+    for source, destination in sources:
+        temporary = destination.with_name(destination.name + ".uploading")
+        shutil.copy2(source, temporary)
+        if temporary.stat().st_size != source.stat().st_size:
+            raise RuntimeError(f"Drive size check failed for {source.name}")
+        temporary.replace(destination)
+    print(f"Drive update verified: {drive_run_root}", flush=True)
+
+
 def main() -> None:
     project = Path("/content/youtube-asl-skeleton-bert")
     local_root = Path("/content/youtube_asl_data")
     local_root.mkdir(parents=True, exist_ok=True)
+    run_root = Path("/content/sign_semantics_youtube_asl/full")
     drive_root = Path("/content/drive/MyDrive")
-    persist_root = (
-        drive_root / "sign_semantics_youtube_asl"
+    drive_run_root = (
+        drive_root / "sign_semantics_youtube_asl/full"
         if drive_root.exists()
-        else Path("/content/sign_semantics_youtube_asl")
+        else None
     )
-    run_root = persist_root / "full"
+    if drive_run_root is not None and (drive_run_root / "completed_shards.json").exists():
+        shutil.copytree(drive_run_root, run_root, dirs_exist_ok=True)
+        print(f"Restored training state from Drive: {drive_run_root}", flush=True)
     checkpoint_root = run_root / "checkpoints"
     checkpoint_root.mkdir(parents=True, exist_ok=True)
     state_path = run_root / "completed_shards.json"
@@ -158,25 +183,28 @@ def main() -> None:
         completed.append(shard)
         completed_this_session += 1
         state_path.write_text(json.dumps(completed))
-        bundle = Path(f"/content/youtube_asl_full_resume_after_shard_{shard:02d}.zip")
-        with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as handle:
-            handle.write(state_path, "completed_shards.json")
-            for name in ("last.pt", "best.pt"):
-                checkpoint = checkpoint_root / name
-                if checkpoint.exists():
-                    handle.write(checkpoint, f"checkpoints/{name}")
-            metrics = checkpoint_root / "metrics.jsonl"
-            if metrics.exists():
-                handle.write(metrics, "checkpoints/metrics.jsonl")
-            metrics_csv = checkpoint_root / "metrics.csv"
-            if metrics_csv.exists():
-                handle.write(metrics_csv, "checkpoints/metrics.csv")
+        if drive_run_root is not None:
+            sync_update_to_drive(state_path, checkpoint_root, drive_run_root)
+            persistence = str(drive_run_root)
+        else:
+            bundle = Path(f"/content/youtube_asl_full_resume_after_shard_{shard:02d}.zip")
+            with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as handle:
+                handle.write(state_path, "completed_shards.json")
+                for name in ("last.pt", "best.pt"):
+                    checkpoint = checkpoint_root / name
+                    if checkpoint.exists():
+                        handle.write(checkpoint, f"checkpoints/{name}")
+                for name in ("metrics.jsonl", "metrics.csv"):
+                    metrics = checkpoint_root / name
+                    if metrics.exists():
+                        handle.write(metrics, f"checkpoints/{name}")
+            persistence = str(bundle)
         archive.unlink()
         elapsed = time.perf_counter() - started
         remaining = len(SHARDS) - len(completed)
         eta_hours = elapsed / max(completed_this_session, 1) * remaining / 3600
         print(
-            f"Completed shard {shard}; checkpoint={resume}; resume_bundle={bundle}; "
+            f"Completed shard {shard}; checkpoint={resume}; persistence={persistence}; "
             f"full_progress={len(completed)}/{len(SHARDS)}; "
             f"session_eta_hours={eta_hours:.1f}",
             flush=True,

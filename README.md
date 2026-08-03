@@ -99,6 +99,16 @@ To continue from a prior stage:
 sign-pretrain --config configs/pretrain.json --resume /path/to/last.pt
 ```
 
+On an Apple-silicon Mac, shard 1 can be downloaded, trained with MPS, and
+deleted only after a non-empty checkpoint is verified with:
+
+```bash
+python scripts/local_train_shard.py --shard 1
+```
+
+Interrupted downloads resume. A failed download, checksum, or training run
+keeps the shard ZIP so that it is not downloaded again.
+
 ## Later word-level RSA
 
 Word-level RSA remains a held-out analysis. A separate isolated-word or manually

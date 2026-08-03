@@ -45,8 +45,8 @@ workflow, but not for all ten roughly 35 GB shards at once.
 Open [`notebooks/colab_pretrain.ipynb`](notebooks/colab_pretrain.ipynb), select a
 GPU runtime, and run the cells. The notebook:
 
-1. verifies the GPU, requires distinct Colab and Drive account emails, mounts
-   the selected Drive account, and checks a persistent account marker;
+1. verifies the GPU and defaults to local browser-download persistence; optional
+   Drive mode checks separate account labels and a persistent account marker;
 2. clones this GitHub repository into `/content`;
 3. installs aria2 and downloads the small official train/dev annotations;
 4. downloads with 16-connection resumable aria2 and, while shard N trains,
@@ -54,10 +54,11 @@ GPU runtime, and run the cells. The notebook:
 5. trains directly from the current ZIP while keeping at most two shards on
    local disk;
 6. saves `last.pt`, `best.pt`, `metrics.jsonl`, and `metrics.csv` locally, then
-   copies and size-verifies them in Drive after every shard;
-7. updates `completed_shards.json` in Drive and only then removes the local
-   shard and prints disk usage;
-8. falls back to a browser-downloaded resume bundle if Drive mounting fails.
+   packages them with `completed_shards.json` after every shard;
+7. automatically downloads that resume ZIP to the user's device and only then
+   removes the local shard and prints disk usage;
+8. optionally copies and size-verifies the same update in Google Drive when
+   `USE_GOOGLE_DRIVE = True`.
 
 During training, a live progress bar and flushed `training_progress` JSON records
 report processed clips, percentage, throughput, loss, optimizer steps, and ETA.
@@ -68,8 +69,12 @@ PCK@0.2; elapsed time; throughput; and peak GPU memory. The loader uses fast
 JSON decoding, reads only the selected 37 facial landmarks, and prefetches
 batches with persistent workers to keep the GPU supplied.
 
-At startup the notebook restores the latest completion state, checkpoints, and
-metric history from Drive. The Drive account can differ from the account that
+The default `USE_GOOGLE_DRIVE = False` mode triggers one browser download per
+completed shard/epoch. Allow automatic or multiple downloads for Colab in the
+browser and keep the newest resume ZIP. At startup the notebook restores an
+uploaded `/content/youtube_asl_full_resume.zip`. In optional Drive mode, it
+restores the latest completion state, checkpoints, and metric history from
+Drive. The Drive account can differ from the account that
 supplies the Colab runtime: the notebook rejects equal email entries and checks
 a marker under `MyDrive/sign_semantics_youtube_asl/`. Google still requires the
 user to confirm the authorisation dialog because `drive.mount()` does not expose

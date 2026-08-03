@@ -130,6 +130,7 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
     print(f"Using device: {device}", flush=True)
 
     data_config = config["data"]
+    print("Indexing training clips from the shard ZIP...", flush=True)
     train_data = YouTubeASLPoseDataset(
         archive=data_config["train_archive"],
         annotations=data_config["train_annotations"],
@@ -137,6 +138,8 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         training=True,
         limit_clips=data_config.get("limit_train_clips"),
     )
+    print(f"Indexed {len(train_data):,} training clips.", flush=True)
+    print("Indexing validation clips from the shard ZIP...", flush=True)
     val_data = YouTubeASLPoseDataset(
         archive=data_config.get("val_archive", data_config["train_archive"]),
         annotations=data_config["val_annotations"],
@@ -144,6 +147,7 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         training=False,
         limit_clips=data_config.get("limit_val_clips"),
     )
+    print(f"Indexed {len(val_data):,} validation clips.", flush=True)
     train_config = config["training"]
     pin_memory = device.type == "cuda"
     worker_options = {}
@@ -169,9 +173,15 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         pin_memory=pin_memory,
         **worker_options,
     )
+    print(
+        f"DataLoaders ready: batch_size={train_config['batch_size']}, "
+        f"workers={data_config['num_workers']}, train_batches={len(train_loader):,}.",
+        flush=True,
+    )
 
     model_config = SkeletonBertConfig(**config["model"])
     model = SkeletonBert(model_config).to(device)
+    print("Model is on the device; preparing optimizer.", flush=True)
     optimizer = AdamW(
         model.parameters(),
         lr=train_config["learning_rate"],
@@ -217,7 +227,10 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
             unit="clips",
             dynamic_ncols=True,
         )
+        print("Waiting for the first training batch...", flush=True)
         for batch_index, batch in enumerate(train_loader):
+            if batch_index == 0:
+                print("First batch loaded; GPU training has started.", flush=True)
             streams, observed, valid = move_batch(batch, device)
             mask = sample_span_mask(
                 valid, mask_config["mask_probability"], mask_config["mean_span_length"]

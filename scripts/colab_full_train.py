@@ -6,6 +6,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import sys
 import time
 import zipfile
 from pathlib import Path
@@ -115,7 +116,14 @@ def main() -> None:
         )
         config_path = Path("/content/colab_pretrain.json")
         config_path.write_text(json.dumps(config, indent=2))
-        command = ["sign-pretrain", "--config", str(config_path)]
+        command = [
+            sys.executable,
+            "-u",
+            "-m",
+            "sign_semantics.train",
+            "--config",
+            str(config_path),
+        ]
         resume = checkpoint_root / "last.pt"
         if completed and resume.exists():
             command += ["--resume", str(resume)]

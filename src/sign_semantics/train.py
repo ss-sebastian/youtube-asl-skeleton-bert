@@ -215,6 +215,8 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
 
     for epoch in range(start_epoch, train_config["epochs"]):
         epoch_started = time.perf_counter()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         model.train()
         optimizer.zero_grad(set_to_none=True)
         running = 0.0
@@ -326,7 +328,21 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
             **{f"train_{name}": round(value, 6) for name, value in train_metrics.items()},
             **{f"val_{name}": round(value, 6) for name, value in val_metrics.items()},
         }
+        if device.type == "cuda":
+            epoch_metrics["gpu_peak_memory_gb"] = round(
+                torch.cuda.max_memory_allocated(device) / 1024**3, 3
+            )
+        print(
+            f"Epoch {epoch + 1} summary: "
+            f"train_loss={epoch_metrics['train_loss']:.6f}, "
+            f"val_loss={epoch_metrics['val_loss']:.6f}, "
+            f"seconds={epoch_metrics['seconds']:.1f}, "
+            f"clips_per_second={epoch_metrics['clips_per_second']:.3f}",
+            flush=True,
+        )
         print("epoch_metrics=" + json.dumps(epoch_metrics, sort_keys=True), flush=True)
+        with (output_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(epoch_metrics, sort_keys=True) + "\n")
         val_loss = val_metrics["loss"]
         payload = {
             "model": model.state_dict(),

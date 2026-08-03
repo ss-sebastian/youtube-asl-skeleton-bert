@@ -140,6 +140,9 @@ def main() -> None:
                 checkpoint = checkpoint_root / name
                 if checkpoint.exists():
                     handle.write(checkpoint, f"checkpoints/{name}")
+            metrics = checkpoint_root / "metrics.jsonl"
+            if metrics.exists():
+                handle.write(metrics, "checkpoints/metrics.jsonl")
         archive.unlink()
         elapsed = time.perf_counter() - started
         remaining = len(SHARDS) - len(completed)

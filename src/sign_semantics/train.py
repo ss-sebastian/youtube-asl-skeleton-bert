@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import time
@@ -18,6 +19,8 @@ from .features import STREAM_JOINTS
 from .masking import sample_span_mask
 from .model import SkeletonBert, SkeletonBertConfig
 from .utils import atomic_torch_save, choose_device, load_json, seed_everything
+
+PCK_THRESHOLDS = (0.1, 0.2)
 
 
 def move_batch(
@@ -78,6 +81,68 @@ def masked_reconstruction_loss(
     return total, {name: float(value.detach()) for name, value in losses.items()}
 
 
+def masked_keypoint_statistics(
+    predictions: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+    supervised: torch.Tensor,
+    observed: dict[str, torch.Tensor],
+) -> dict[str, float]:
+    """Accumulate exact masked-joint errors in shoulder-width-normalized units."""
+    statistics: dict[str, float] = {}
+    for stream in ("all", *STREAM_JOINTS):
+        statistics[f"{stream}_distance_sum"] = 0.0
+        statistics[f"{stream}_distance_squared_sum"] = 0.0
+        statistics[f"{stream}_count"] = 0.0
+        for threshold in PCK_THRESHOLDS:
+            statistics[f"{stream}_within_{threshold}"] = 0.0
+
+    for name in STREAM_JOINTS:
+        point_mask = supervised.unsqueeze(-1) & observed[name]
+        distances = torch.linalg.vector_norm(
+            predictions[name].float() - targets[name].float(), dim=-1
+        )
+        selected = distances[point_mask]
+        if selected.numel() == 0:
+            continue
+        distance_sum = float(selected.sum())
+        distance_squared_sum = float(selected.square().sum())
+        count = float(selected.numel())
+        for stream in ("all", name):
+            statistics[f"{stream}_distance_sum"] += distance_sum
+            statistics[f"{stream}_distance_squared_sum"] += distance_squared_sum
+            statistics[f"{stream}_count"] += count
+            for threshold in PCK_THRESHOLDS:
+                statistics[f"{stream}_within_{threshold}"] += float(
+                    (selected <= threshold).sum()
+                )
+    return statistics
+
+
+def add_statistics(total: dict[str, float], update: dict[str, float]) -> None:
+    for name, value in update.items():
+        total[name] = total.get(name, 0.0) + value
+
+
+def summarize_keypoint_statistics(statistics: dict[str, float]) -> dict[str, float]:
+    """Return MPJPE, RMSE, and PCK for all points and each landmark stream."""
+    metrics: dict[str, float] = {}
+    for stream in ("all", *STREAM_JOINTS):
+        count = max(statistics.get(f"{stream}_count", 0.0), 1.0)
+        prefix = "" if stream == "all" else f"{stream}_"
+        metrics[f"{prefix}mpjpe"] = (
+            statistics.get(f"{stream}_distance_sum", 0.0) / count
+        )
+        metrics[f"{prefix}rmse"] = math.sqrt(
+            statistics.get(f"{stream}_distance_squared_sum", 0.0) / count
+        )
+        for threshold in PCK_THRESHOLDS:
+            label = str(threshold).replace(".", "_")
+            metrics[f"{prefix}pck_{label}"] = (
+                statistics.get(f"{stream}_within_{threshold}", 0.0) / count
+            )
+    return metrics
+
+
 def cosine_schedule(
     optimizer: AdamW, warmup_steps: int, total_steps: int
 ) -> torch.optim.lr_scheduler.LambdaLR:
@@ -101,6 +166,7 @@ def validate(
 ) -> dict[str, float]:
     model.eval()
     totals = {"loss": 0.0, **{name: 0.0 for name in STREAM_JOINTS}}
+    keypoint_totals: dict[str, float] = {}
     clips = 0
     generator = torch.Generator().manual_seed(0)
     progress = tqdm(total=len(loader.dataset), desc="validation", unit="clips", leave=False)
@@ -111,6 +177,12 @@ def validate(
         loss, stream_losses = masked_reconstruction_loss(
             predictions, streams, mask & valid, velocity_weight, observed
         )
+        add_statistics(
+            keypoint_totals,
+            masked_keypoint_statistics(
+                predictions, streams, mask & valid, observed
+            ),
+        )
         batch_clips = int(valid.shape[0])
         clips += batch_clips
         totals["loss"] += float(loss) * batch_clips
@@ -118,7 +190,9 @@ def validate(
             totals[name] += value * batch_clips
         progress.update(batch_clips)
     progress.close()
-    return {name: value / max(clips, 1) for name, value in totals.items()}
+    metrics = {name: value / max(clips, 1) for name, value in totals.items()}
+    metrics.update(summarize_keypoint_statistics(keypoint_totals))
+    return metrics
 
 
 def run_training(config_path: Path, resume: Path | None = None) -> None:
@@ -222,6 +296,7 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         running = 0.0
         logged_batches = 0
         epoch_totals = {"loss": 0.0, **{name: 0.0 for name in STREAM_JOINTS}}
+        epoch_keypoint_totals: dict[str, float] = {}
         epoch_clips = 0
         progress = tqdm(
             total=len(train_data),
@@ -251,6 +326,9 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
                     mask_config["velocity_weight"],
                     observed,
                 )
+                batch_keypoint_statistics = masked_keypoint_statistics(
+                    predictions, streams, mask & valid, observed
+                )
                 group_start = (batch_index // accumulation) * accumulation
                 group_size = min(accumulation, len(train_loader) - group_start)
                 scaled_loss = loss / group_size
@@ -262,6 +340,7 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
             epoch_totals["loss"] += float(loss.detach()) * batch_clips
             for name, value in stream_losses.items():
                 epoch_totals[name] += value * batch_clips
+            add_statistics(epoch_keypoint_totals, batch_keypoint_statistics)
             progress.update(batch_clips)
 
             last_batch = batch_index + 1 == len(train_loader)
@@ -310,6 +389,7 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         train_metrics = {
             name: value / max(epoch_clips, 1) for name, value in epoch_totals.items()
         }
+        train_metrics.update(summarize_keypoint_statistics(epoch_keypoint_totals))
         val_metrics = validate(
             model,
             val_loader,
@@ -332,10 +412,15 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
             epoch_metrics["gpu_peak_memory_gb"] = round(
                 torch.cuda.max_memory_allocated(device) / 1024**3, 3
             )
+        else:
+            epoch_metrics["gpu_peak_memory_gb"] = 0.0
         print(
             f"Epoch {epoch + 1} summary: "
             f"train_loss={epoch_metrics['train_loss']:.6f}, "
             f"val_loss={epoch_metrics['val_loss']:.6f}, "
+            f"val_mpjpe={epoch_metrics['val_mpjpe']:.4f}, "
+            f"val_pck@0.1={epoch_metrics['val_pck_0_1']:.3f}, "
+            f"val_pck@0.2={epoch_metrics['val_pck_0_2']:.3f}, "
             f"seconds={epoch_metrics['seconds']:.1f}, "
             f"clips_per_second={epoch_metrics['clips_per_second']:.3f}",
             flush=True,
@@ -343,6 +428,12 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         print("epoch_metrics=" + json.dumps(epoch_metrics, sort_keys=True), flush=True)
         with (output_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(epoch_metrics, sort_keys=True) + "\n")
+        metrics_csv = output_dir / "metrics.csv"
+        with metrics_csv.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(epoch_metrics))
+            if metrics_csv.stat().st_size == 0:
+                writer.writeheader()
+            writer.writerow(epoch_metrics)
         val_loss = val_metrics["loss"]
         payload = {
             "model": model.state_dict(),
@@ -357,7 +448,8 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         if val_loss < best_val:
             best_val = val_loss
             atomic_torch_save(payload, output_dir / "best.pt")
-        if (epoch + 1) % train_config["save_every"] == 0:
+        save_every = int(train_config["save_every"])
+        if save_every > 0 and (epoch + 1) % save_every == 0:
             atomic_torch_save(payload, output_dir / f"epoch_{epoch + 1:03d}.pt")
 
 

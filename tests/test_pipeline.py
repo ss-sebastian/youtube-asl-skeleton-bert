@@ -15,7 +15,11 @@ from sign_semantics.features import STREAM_JOINTS
 from sign_semantics.masking import sample_span_mask
 from sign_semantics.model import SkeletonBert, SkeletonBertConfig, masked_mean
 from sign_semantics.rsa import run_rsa
-from sign_semantics.train import masked_reconstruction_loss
+from sign_semantics.train import (
+    masked_keypoint_statistics,
+    masked_reconstruction_loss,
+    summarize_keypoint_statistics,
+)
 from sign_semantics.word_extract import load_boundaries
 
 
@@ -109,6 +113,27 @@ class PipelineTest(unittest.TestCase):
         streams, observed = parse_youtube_asl(payload)
         self.assertFalse(observed["hands"][1, :21].any())
         self.assertTrue(np.all(streams["hands"][1, :21] == 0))
+
+    def test_masked_keypoint_metrics_use_observed_supervised_points(self) -> None:
+        targets = {
+            name: torch.zeros((1, 2, joints, 2))
+            for name, joints in STREAM_JOINTS.items()
+        }
+        predictions = {name: value.clone() for name, value in targets.items()}
+        predictions["body"][0, 0, 0] = torch.tensor([0.06, 0.08])
+        observed = {
+            name: torch.ones((1, 2, joints), dtype=torch.bool)
+            for name, joints in STREAM_JOINTS.items()
+        }
+        supervised = torch.tensor([[True, False]])
+        statistics = masked_keypoint_statistics(
+            predictions, targets, supervised, observed
+        )
+        metrics = summarize_keypoint_statistics(statistics)
+
+        self.assertGreater(metrics["mpjpe"], 0.0)
+        self.assertAlmostEqual(metrics["body_pck_0_1"], 1.0)
+        self.assertEqual(metrics["hands_mpjpe"], 0.0)
 
     def test_long_validation_clip_selects_frames_before_feature_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

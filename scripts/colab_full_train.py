@@ -41,10 +41,34 @@ def md5(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
 
 
 def download(target: Path, identifier: str) -> None:
-    subprocess.run(
-        ["wget", "-c", "--show-progress", "-O", str(target), url(identifier)],
-        check=True,
-    )
+    aria2 = shutil.which("aria2c")
+    if aria2 is not None:
+        command = [
+            aria2,
+            "--continue=true",
+            "--max-connection-per-server=16",
+            "--split=16",
+            "--min-split-size=16M",
+            "--file-allocation=none",
+            "--auto-file-renaming=false",
+            "--allow-overwrite=false",
+            "--max-tries=0",
+            "--retry-wait=5",
+            "--summary-interval=10",
+            f"--dir={target.parent}",
+            f"--out={target.name}",
+            url(identifier),
+        ]
+    else:
+        command = [
+            "wget",
+            "-c",
+            "--show-progress",
+            "-O",
+            str(target),
+            url(identifier),
+        ]
+    subprocess.run(command, check=True)
 
 
 def main() -> None:
@@ -112,6 +136,7 @@ def main() -> None:
                 "progress_every": 1,
                 "epochs": len(completed) + 1,
                 "amp": True,
+                "save_every": 0,
             }
         )
         config_path = Path("/content/colab_pretrain.json")
@@ -143,6 +168,9 @@ def main() -> None:
             metrics = checkpoint_root / "metrics.jsonl"
             if metrics.exists():
                 handle.write(metrics, "checkpoints/metrics.jsonl")
+            metrics_csv = checkpoint_root / "metrics.csv"
+            if metrics_csv.exists():
+                handle.write(metrics_csv, "checkpoints/metrics.csv")
         archive.unlink()
         elapsed = time.perf_counter() - started
         remaining = len(SHARDS) - len(completed)

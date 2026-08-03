@@ -35,42 +35,48 @@ The project uses the official
 
 The data is not committed to GitHub and the Colab workflow does not put it in
 Google Drive. A shard stays temporarily under `/content`, is read directly from
-the ZIP without extraction, and is deleted after that stage finishes.
+the ZIP without extraction, and is deleted after its checkpoint and resume
+bundle are verified. Roughly 165 GB of free Colab disk is enough for this
+one-shard-at-a-time workflow, but not for all ten roughly 35 GB shards at once.
 
 ## Colab training
 
 Open [`notebooks/colab_pretrain.ipynb`](notebooks/colab_pretrain.ipynb), select a
 GPU runtime, and run the cells. The notebook:
 
-1. attempts to mount Google Drive for model outputs only;
+1. verifies the GPU and reports local Colab disk space without mounting Drive;
 2. clones this GitHub repository into `/content`;
-3. downloads the small official train/dev annotation files into `/content`;
-4. downloads one keypoint shard at a time into `/content`;
+3. installs aria2 and downloads the small official train/dev annotations;
+4. downloads one keypoint shard at a time with 16-connection resumable aria2;
 5. trains directly from that ZIP;
-6. saves `last.pt`, `best.pt`, logs, and completion state under
-   `MyDrive/sign_semantics_youtube_asl/` when Drive is available;
-7. removes the local shard after successful training.
+6. saves `last.pt`, `best.pt`, `metrics.jsonl`, and `metrics.csv` locally and
+   downloads a compact resume bundle after every shard;
+7. removes the local shard after successful training and prints disk usage;
+8. optionally mounts a separately authorised Drive account after training to
+   copy the final model bundle only.
 
 During training, a live progress bar and flushed `training_progress` JSON records
 report processed clips, percentage, throughput, loss, optimizer steps, and ETA.
-At the end of every epoch, the trainer prints one machine-readable
-`epoch_metrics` JSON record containing train/validation total,
-body, hands, and face losses, elapsed time, and clips per second. The loader uses
-fast JSON decoding, reads only the selected 37 facial landmarks, and prefetches
+At the end of every epoch, the trainer prints a readable summary and one
+machine-readable `epoch_metrics` JSON record. Both metric files contain
+train/validation total, body, hands, and face losses; MPJPE; RMSE; PCK@0.1 and
+PCK@0.2; elapsed time; throughput; and peak GPU memory. The loader uses fast
+JSON decoding, reads only the selected 37 facial landmarks, and prefetches
 batches with persistent workers to keep the GPU supplied.
 
-If Colab's Drive credential propagation fails, the notebook keeps training and
-downloads a compact resume ZIP after every completed shard. Save the newest ZIP.
+The notebook does not require Drive before training. It downloads a compact
+resume ZIP after every completed shard. Save the newest ZIP.
 Before the next session, upload it to Colab as
 `/content/youtube_asl_full_resume.zip`; the notebook restores the completion
-state and checkpoints automatically, skips finished shards, and continues with
-the next shard. Dataset shards remain temporary and are never copied to Drive.
+state, checkpoints, and metric history automatically, skips finished shards,
+and continues with the next shard. Dataset shards remain temporary and are
+never copied to Drive.
 
 The committed Colab notebook now defaults to `MODE = "full"` after the pilot was
 successfully completed. For a fresh environment, set `MODE = "pilot"` to
-verify GPU, data, loss, and Drive output before returning to full mode. If Colab
-disconnects between shards, rerunning the notebook reads the completion state
-from Drive or the uploaded resume bundle and continues with the next shard.
+verify GPU, data, and loss before returning to full mode. If Colab disconnects
+between shards, rerunning the notebook reads the uploaded resume bundle and
+continues with the next shard.
 
 Ten 37 GB downloads plus training are not expected to finish in one free Colab
 session. The notebook is intentionally resumable across sessions.

@@ -72,8 +72,11 @@ At startup the notebook restores the latest completion state, checkpoints, and
 metric history from Drive. The Drive account can differ from the account that
 supplies the Colab runtime: the notebook rejects equal email entries and checks
 a marker under `MyDrive/sign_semantics_youtube_asl/`. Google still requires the
-user to choose the intended account in its authorisation dialog because
-`drive.mount()` does not expose the mounted email to Python. If Drive is
+user to confirm the authorisation dialog because `drive.mount()` does not expose
+the mounted email to Python. If Google forces the Colab account, the target
+Drive account should share an editor folder with the Colab account, which adds
+that folder to My Drive as a shortcut named `sign_semantics_youtube_asl`.
+Checkpoint writes then follow the shortcut into the shared folder. If Drive is
 unavailable, save the newest fallback resume ZIP and upload it later as
 `/content/youtube_asl_full_resume.zip`. Dataset shards remain temporary and are
 never copied to Drive.

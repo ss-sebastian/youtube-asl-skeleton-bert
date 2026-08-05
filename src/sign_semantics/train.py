@@ -17,10 +17,11 @@ from tqdm.auto import tqdm
 from .data import YouTubeASLPoseDataset
 from .features import STREAM_JOINTS
 from .masking import sample_span_mask
-from .model import SkeletonBert, SkeletonBertConfig
+from .model import SkeletonBert, SkeletonBertConfig, masked_mean
 from .utils import atomic_torch_save, choose_device, load_json, seed_everything
 
 PCK_THRESHOLDS = (0.1, 0.2)
+OBJECTIVES = ("masked_reconstruction", "next_frame", "contrastive")
 
 
 def move_batch(
@@ -81,6 +82,183 @@ def masked_reconstruction_loss(
     return total, {name: float(value.detach()) for name, value in losses.items()}
 
 
+def next_frame_objective(
+    model: SkeletonBert,
+    streams: dict[str, torch.Tensor],
+    observed: dict[str, torch.Tensor],
+    valid: torch.Tensor,
+    velocity_weight: float,
+) -> tuple[torch.Tensor, dict[str, float], dict[str, float]]:
+    """Predict frame t+1 from frames up to t using causal self-attention."""
+    inputs = {name: values[:, :-1] for name, values in streams.items()}
+    targets = {name: values[:, 1:] for name, values in streams.items()}
+    target_observed = {name: values[:, 1:] for name, values in observed.items()}
+    input_valid = valid[:, :-1]
+    supervised = input_valid & valid[:, 1:]
+    if not supervised.any():
+        raise ValueError("Next-frame prediction requires at least one two-frame clip")
+    predictions = model(inputs, input_valid, causal=True)
+    loss, stream_losses = masked_reconstruction_loss(
+        predictions,
+        targets,
+        supervised,
+        velocity_weight,
+        target_observed,
+    )
+    statistics = masked_keypoint_statistics(
+        predictions, targets, supervised, target_observed
+    )
+    return loss, stream_losses, statistics
+
+
+def _random_like(
+    reference: torch.Tensor,
+    generator: torch.Generator | None,
+    normal: bool,
+) -> torch.Tensor:
+    """Draw deterministically on CPU for validation, directly on-device otherwise."""
+    if generator is None:
+        return torch.randn_like(reference) if normal else torch.rand_like(reference)
+    sampler = torch.randn if normal else torch.rand
+    return sampler(
+        reference.shape, dtype=reference.dtype, generator=generator, device="cpu"
+    ).to(reference.device)
+
+
+def contrastive_view(
+    streams: dict[str, torch.Tensor],
+    observed: dict[str, torch.Tensor],
+    valid: torch.Tensor,
+    coordinate_jitter_std: float,
+    landmark_dropout_probability: float,
+    generator: torch.Generator | None = None,
+) -> dict[str, torch.Tensor]:
+    """Create a mild trajectory view without changing order or handedness."""
+    if coordinate_jitter_std < 0:
+        raise ValueError("coordinate_jitter_std must be non-negative")
+    if not 0 <= landmark_dropout_probability < 1:
+        raise ValueError("landmark_dropout_probability must be in [0, 1)")
+    view: dict[str, torch.Tensor] = {}
+    for name, values in streams.items():
+        seen = observed[name] & valid.unsqueeze(-1)
+        augmented = values.clone()
+        if coordinate_jitter_std:
+            noise = _random_like(values, generator, normal=True)
+            augmented = augmented + noise * coordinate_jitter_std * seen.unsqueeze(-1)
+        if landmark_dropout_probability:
+            draws = _random_like(seen.float(), generator, normal=False)
+            keep = (draws >= landmark_dropout_probability) & seen
+            augmented = torch.where(keep.unsqueeze(-1), augmented, torch.zeros_like(augmented))
+        view[name] = augmented
+    return view
+
+
+def contrastive_objective(
+    model: SkeletonBert,
+    streams: dict[str, torch.Tensor],
+    observed: dict[str, torch.Tensor],
+    valid: torch.Tensor,
+    config: dict,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, dict[str, float], dict[str, float]]:
+    """Symmetric in-batch InfoNCE over two corrupted views of each sentence."""
+    temperature = float(config.get("temperature", 0.1))
+    if temperature <= 0:
+        raise ValueError("contrastive temperature must be positive")
+    view_kwargs = {
+        "coordinate_jitter_std": float(config.get("coordinate_jitter_std", 0.01)),
+        "landmark_dropout_probability": float(
+            config.get("landmark_dropout_probability", 0.05)
+        ),
+        "generator": generator,
+    }
+    first = contrastive_view(streams, observed, valid, **view_kwargs)
+    second = contrastive_view(streams, observed, valid, **view_kwargs)
+    mask_probability = float(config.get("view_mask_probability", 0.2))
+    span_length = int(config.get("view_mean_span_length", 10))
+    first_mask = sample_span_mask(valid, mask_probability, span_length, generator)
+    second_mask = sample_span_mask(valid, mask_probability, span_length, generator)
+    first_hidden = model.encode(first, valid, first_mask)
+    second_hidden = model.encode(second, valid, second_mask)
+    assert isinstance(first_hidden, torch.Tensor)
+    assert isinstance(second_hidden, torch.Tensor)
+    first_embedding = F.normalize(masked_mean(first_hidden, valid), dim=-1)
+    second_embedding = F.normalize(masked_mean(second_hidden, valid), dim=-1)
+    logits = first_embedding @ second_embedding.T / temperature
+    labels = torch.arange(logits.shape[0], device=logits.device)
+    loss = 0.5 * (
+        F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)
+    )
+    similarities = first_embedding @ second_embedding.T
+    positive_similarity = similarities.diagonal().mean()
+    if similarities.shape[0] > 1:
+        off_diagonal = ~torch.eye(
+            similarities.shape[0], dtype=torch.bool, device=similarities.device
+        )
+        negative_similarity = similarities[off_diagonal].mean()
+    else:
+        negative_similarity = similarities.new_zeros(())
+    retrieval_accuracy = 0.5 * (
+        (logits.argmax(dim=1) == labels).float().mean()
+        + (logits.argmax(dim=0) == labels).float().mean()
+    )
+    embedding_std = torch.cat([first_embedding, second_embedding], dim=0).std(
+        dim=0, unbiased=False
+    ).mean()
+    metrics = {
+        "positive_similarity": float(positive_similarity.detach()),
+        "negative_similarity": float(negative_similarity.detach()),
+        "retrieval_accuracy": float(retrieval_accuracy.detach()),
+        "embedding_std": float(embedding_std.detach()),
+    }
+    return loss, metrics, {}
+
+
+def compute_objective(
+    model: SkeletonBert,
+    streams: dict[str, torch.Tensor],
+    observed: dict[str, torch.Tensor],
+    valid: torch.Tensor,
+    objective_config: dict,
+    masking_config: dict,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, dict[str, float], dict[str, float]]:
+    """Run one of the matched-backbone pretraining objectives."""
+    name = str(objective_config.get("name", "masked_reconstruction"))
+    if name == "masked_reconstruction":
+        mask = sample_span_mask(
+            valid,
+            float(masking_config["mask_probability"]),
+            int(masking_config["mean_span_length"]),
+            generator,
+        )
+        predictions = model(streams, valid, mask)
+        loss, metrics = masked_reconstruction_loss(
+            predictions,
+            streams,
+            mask & valid,
+            float(masking_config["velocity_weight"]),
+            observed,
+        )
+        statistics = masked_keypoint_statistics(
+            predictions, streams, mask & valid, observed
+        )
+        return loss, metrics, statistics
+    if name == "next_frame":
+        return next_frame_objective(
+            model,
+            streams,
+            observed,
+            valid,
+            float(objective_config.get("velocity_weight", masking_config["velocity_weight"])),
+        )
+    if name == "contrastive":
+        return contrastive_objective(
+            model, streams, observed, valid, objective_config, generator
+        )
+    raise ValueError(f"Unknown objective {name!r}; expected one of {OBJECTIVES}")
+
+
 def masked_keypoint_statistics(
     predictions: dict[str, torch.Tensor],
     targets: dict[str, torch.Tensor],
@@ -104,8 +282,8 @@ def masked_keypoint_statistics(
         selected = distances[point_mask]
         if selected.numel() == 0:
             continue
-        distance_sum = float(selected.sum())
-        distance_squared_sum = float(selected.square().sum())
+        distance_sum = float(selected.detach().sum())
+        distance_squared_sum = float(selected.detach().square().sum())
         count = float(selected.numel())
         for stream in ("all", name):
             statistics[f"{stream}_distance_sum"] += distance_sum
@@ -113,7 +291,7 @@ def masked_keypoint_statistics(
             statistics[f"{stream}_count"] += count
             for threshold in PCK_THRESHOLDS:
                 statistics[f"{stream}_within_{threshold}"] += float(
-                    (selected <= threshold).sum()
+                    (selected.detach() <= threshold).sum()
                 )
     return statistics
 
@@ -160,48 +338,51 @@ def validate(
     model: SkeletonBert,
     loader: DataLoader,
     device: torch.device,
-    mask_probability: float,
-    span_length: int,
-    velocity_weight: float,
+    objective_config: dict,
+    masking_config: dict,
 ) -> dict[str, float]:
     model.eval()
-    totals = {"loss": 0.0, **{name: 0.0 for name in STREAM_JOINTS}}
+    totals: dict[str, float] = {"loss": 0.0}
     keypoint_totals: dict[str, float] = {}
     clips = 0
     generator = torch.Generator().manual_seed(0)
     progress = tqdm(total=len(loader.dataset), desc="validation", unit="clips", leave=False)
     for batch in loader:
         streams, observed, valid = move_batch(batch, device)
-        mask = sample_span_mask(valid, mask_probability, span_length, generator)
-        predictions = model(streams, valid, mask)
-        loss, stream_losses = masked_reconstruction_loss(
-            predictions, streams, mask & valid, velocity_weight, observed
+        loss, objective_metrics, keypoint_statistics = compute_objective(
+            model,
+            streams,
+            observed,
+            valid,
+            objective_config,
+            masking_config,
+            generator,
         )
-        add_statistics(
-            keypoint_totals,
-            masked_keypoint_statistics(
-                predictions, streams, mask & valid, observed
-            ),
-        )
+        add_statistics(keypoint_totals, keypoint_statistics)
         batch_clips = int(valid.shape[0])
         clips += batch_clips
         totals["loss"] += float(loss) * batch_clips
-        for name, value in stream_losses.items():
-            totals[name] += value * batch_clips
+        for name, value in objective_metrics.items():
+            totals[name] = totals.get(name, 0.0) + value * batch_clips
         progress.update(batch_clips)
     progress.close()
     metrics = {name: value / max(clips, 1) for name, value in totals.items()}
-    metrics.update(summarize_keypoint_statistics(keypoint_totals))
+    if keypoint_totals:
+        metrics.update(summarize_keypoint_statistics(keypoint_totals))
     return metrics
 
 
 def run_training(config_path: Path, resume: Path | None = None) -> None:
     config = load_json(config_path)
+    objective_config = config.get("objective", {"name": "masked_reconstruction"})
+    objective_name = str(objective_config.get("name", "masked_reconstruction"))
+    if objective_name not in OBJECTIVES:
+        raise ValueError(f"Unknown objective {objective_name!r}; expected one of {OBJECTIVES}")
     seed_everything(int(config["seed"]))
     device = choose_device()
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
-    print(f"Using device: {device}", flush=True)
+    print(f"Using device: {device}; objective={objective_name}", flush=True)
 
     data_config = config["data"]
     print("Indexing training clips from the shard ZIP...", flush=True)
@@ -253,7 +434,9 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         flush=True,
     )
 
-    model_config = SkeletonBertConfig(**config["model"])
+    model_values = dict(config["model"])
+    model_values["causal_attention"] = objective_name == "next_frame"
+    model_config = SkeletonBertConfig(**model_values)
     model = SkeletonBert(model_config).to(device)
     print("Model is on the device; preparing optimizer.", flush=True)
     optimizer = AdamW(
@@ -275,6 +458,12 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
 
     if resume is not None:
         checkpoint = torch.load(resume, map_location=device, weights_only=False)
+        checkpoint_objective = checkpoint.get("objective", "masked_reconstruction")
+        if checkpoint_objective != objective_name:
+            raise ValueError(
+                f"Checkpoint objective {checkpoint_objective!r} does not match "
+                f"configured objective {objective_name!r}"
+            )
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -295,7 +484,7 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         optimizer.zero_grad(set_to_none=True)
         running = 0.0
         logged_batches = 0
-        epoch_totals = {"loss": 0.0, **{name: 0.0 for name in STREAM_JOINTS}}
+        epoch_totals: dict[str, float] = {"loss": 0.0}
         epoch_keypoint_totals: dict[str, float] = {}
         epoch_clips = 0
         progress = tqdm(
@@ -309,25 +498,19 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
             if batch_index == 0:
                 print("First batch loaded; GPU training has started.", flush=True)
             streams, observed, valid = move_batch(batch, device)
-            mask = sample_span_mask(
-                valid, mask_config["mask_probability"], mask_config["mean_span_length"]
-            )
             autocast = (
                 torch.autocast(device_type="cuda", dtype=torch.float16)
                 if amp_enabled
                 else nullcontext()
             )
             with autocast:
-                predictions = model(streams, valid, mask)
-                loss, stream_losses = masked_reconstruction_loss(
-                    predictions,
+                loss, objective_metrics, batch_keypoint_statistics = compute_objective(
+                    model,
                     streams,
-                    mask & valid,
-                    mask_config["velocity_weight"],
                     observed,
-                )
-                batch_keypoint_statistics = masked_keypoint_statistics(
-                    predictions, streams, mask & valid, observed
+                    valid,
+                    objective_config,
+                    mask_config,
                 )
                 group_start = (batch_index // accumulation) * accumulation
                 group_size = min(accumulation, len(train_loader) - group_start)
@@ -338,8 +521,8 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
             batch_clips = int(valid.shape[0])
             epoch_clips += batch_clips
             epoch_totals["loss"] += float(loss.detach()) * batch_clips
-            for name, value in stream_losses.items():
-                epoch_totals[name] += value * batch_clips
+            for name, value in objective_metrics.items():
+                epoch_totals[name] = epoch_totals.get(name, 0.0) + value * batch_clips
             add_statistics(epoch_keypoint_totals, batch_keypoint_statistics)
             progress.update(batch_clips)
 
@@ -389,14 +572,14 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         train_metrics = {
             name: value / max(epoch_clips, 1) for name, value in epoch_totals.items()
         }
-        train_metrics.update(summarize_keypoint_statistics(epoch_keypoint_totals))
+        if epoch_keypoint_totals:
+            train_metrics.update(summarize_keypoint_statistics(epoch_keypoint_totals))
         val_metrics = validate(
             model,
             val_loader,
             device,
-            mask_config["mask_probability"],
-            mask_config["mean_span_length"],
-            mask_config["velocity_weight"],
+            objective_config,
+            mask_config,
         )
         epoch_seconds = time.perf_counter() - epoch_started
         epoch_metrics = {
@@ -414,17 +597,29 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
             )
         else:
             epoch_metrics["gpu_peak_memory_gb"] = 0.0
-        print(
-            f"Epoch {epoch + 1} summary: "
+        summary = (
+            f"Epoch {epoch + 1} summary: objective={objective_name}, "
             f"train_loss={epoch_metrics['train_loss']:.6f}, "
-            f"val_loss={epoch_metrics['val_loss']:.6f}, "
-            f"val_mpjpe={epoch_metrics['val_mpjpe']:.4f}, "
-            f"val_pck@0.1={epoch_metrics['val_pck_0_1']:.3f}, "
-            f"val_pck@0.2={epoch_metrics['val_pck_0_2']:.3f}, "
-            f"seconds={epoch_metrics['seconds']:.1f}, "
-            f"clips_per_second={epoch_metrics['clips_per_second']:.3f}",
-            flush=True,
+            f"val_loss={epoch_metrics['val_loss']:.6f}"
         )
+        if "val_mpjpe" in epoch_metrics:
+            summary += (
+                f", val_mpjpe={epoch_metrics['val_mpjpe']:.4f}, "
+                f"val_pck@0.1={epoch_metrics['val_pck_0_1']:.3f}, "
+                f"val_pck@0.2={epoch_metrics['val_pck_0_2']:.3f}"
+            )
+        if "val_retrieval_accuracy" in epoch_metrics:
+            summary += (
+                f", val_retrieval_accuracy="
+                f"{epoch_metrics['val_retrieval_accuracy']:.3f}, "
+                f"val_positive_similarity="
+                f"{epoch_metrics['val_positive_similarity']:.3f}"
+            )
+        summary += (
+            f", seconds={epoch_metrics['seconds']:.1f}, "
+            f"clips_per_second={epoch_metrics['clips_per_second']:.3f}"
+        )
+        print(summary, flush=True)
         print("epoch_metrics=" + json.dumps(epoch_metrics, sort_keys=True), flush=True)
         with (output_dir / "metrics.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(epoch_metrics, sort_keys=True) + "\n")
@@ -443,6 +638,8 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
             "global_step": global_step,
             "best_val": min(best_val, val_loss),
             "model_config": model_config.to_dict(),
+            "objective": objective_name,
+            "objective_config": objective_config,
         }
         atomic_torch_save(payload, output_dir / "last.pt")
         if val_loss < best_val:
@@ -454,7 +651,7 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Pretrain BERT on masked skeleton trajectories")
+    parser = argparse.ArgumentParser(description="Pretrain a Transformer on skeleton trajectories")
     parser.add_argument("--config", type=Path, default=Path("configs/pretrain.json"))
     parser.add_argument("--resume", type=Path)
     return parser

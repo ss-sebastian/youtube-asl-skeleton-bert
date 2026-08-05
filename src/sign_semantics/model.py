@@ -20,13 +20,14 @@ class SkeletonBertConfig:
     hidden_dropout_prob: float = 0.1
     attention_probs_dropout_prob: float = 0.1
     max_frames: int = 256
+    causal_attention: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 class SkeletonBert(nn.Module):
-    """A single-stream temporal BERT with masked skeleton reconstruction.
+    """A single-stream temporal Transformer shared by all pretraining objectives.
 
     BERT is randomly initialized. It receives continuous frame embeddings through
     ``inputs_embeds`` and never receives text, glosses, or pretrained language weights.
@@ -61,6 +62,8 @@ class SkeletonBert(nn.Module):
             max_position_embeddings=config.max_frames,
             type_vocab_size=1,
             pad_token_id=0,
+            is_decoder=config.causal_attention,
+            use_cache=False,
         )
         self.bert = BertModel(bert_config, add_pooling_layer=False)
         self.reconstruction_head = nn.Linear(config.hidden_size, self.input_dim)
@@ -80,6 +83,7 @@ class SkeletonBert(nn.Module):
         streams: dict[str, torch.Tensor],
         valid: torch.Tensor,
         mask: torch.Tensor | None = None,
+        causal: bool = False,
         return_all_layers: bool = False,
     ) -> torch.Tensor | list[torch.Tensor]:
         frames = self.flatten_streams(streams)
@@ -90,9 +94,14 @@ class SkeletonBert(nn.Module):
         embeddings = self.input_projection(self.input_norm(frames))
         if mask is not None:
             embeddings = torch.where(mask.unsqueeze(-1), self.mask_token, embeddings)
+        if causal != self.config.causal_attention:
+            raise ValueError(
+                "The requested attention direction does not match the model configuration"
+            )
         outputs = self.bert(
             inputs_embeds=embeddings,
             attention_mask=valid.to(dtype=torch.long),
+            use_cache=False,
             output_hidden_states=return_all_layers,
             return_dict=True,
         )
@@ -106,9 +115,10 @@ class SkeletonBert(nn.Module):
         self,
         streams: dict[str, torch.Tensor],
         valid: torch.Tensor,
-        mask: torch.Tensor,
+        mask: torch.Tensor | None = None,
+        causal: bool = False,
     ) -> dict[str, torch.Tensor]:
-        hidden = self.encode(streams, valid, mask)
+        hidden = self.encode(streams, valid, mask, causal=causal)
         assert isinstance(hidden, torch.Tensor)
         return self.split_reconstruction(self.reconstruction_head(hidden))
 

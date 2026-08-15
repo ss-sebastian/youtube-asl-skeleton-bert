@@ -186,6 +186,70 @@ def _collapse_runs(units: np.ndarray) -> list[int]:
     return [int(value) for index, value in enumerate(units) if index == 0 or value != units[index - 1]]
 
 
+def leave_one_signer_out_scores(
+    matrix: np.ndarray, labels: np.ndarray, signers: np.ndarray
+) -> tuple[float, float, float, float]:
+    """Strict prototype retrieval with all tokens of the query signer excluded."""
+    ranks = []
+    same_distances = []
+    different_distances = []
+    for signer in sorted(set(signers.tolist())):
+        query_indices = np.flatnonzero(signers == signer)
+        train_indices = np.flatnonzero(signers != signer)
+        candidates, inverse = np.unique(labels[train_indices], return_inverse=True)
+        sums = np.zeros((len(candidates), matrix.shape[1]), dtype=np.float32)
+        np.add.at(sums, inverse, matrix[train_indices])
+        counts = np.bincount(inverse, minlength=len(candidates)).astype(np.float32)
+        prototypes = sums / counts[:, None].clip(min=1)
+        prototypes /= np.linalg.norm(prototypes, axis=1, keepdims=True).clip(min=1e-8)
+        similarities = matrix[query_indices] @ prototypes.T
+        for row_index, query_index in enumerate(query_indices):
+            matches = np.flatnonzero(candidates == labels[query_index])
+            if len(matches) == 0:
+                ranks.append(len(candidates) + 1)
+                different_distances.extend((1 - similarities[row_index]).tolist())
+                continue
+            target = int(matches[0])
+            order = np.argsort(-similarities[row_index])
+            ranks.append(int(np.flatnonzero(order == target)[0]) + 1)
+            same_distances.append(float(1 - similarities[row_index, target]))
+            different_distances.extend(
+                (1 - np.delete(similarities[row_index], target)).tolist()
+            )
+    ranks_array = np.asarray(ranks)
+    separation = (
+        float(np.mean(different_distances) - np.mean(same_distances))
+        if same_distances
+        else float("nan")
+    )
+    return (
+        float((ranks_array == 1).mean()),
+        float((ranks_array <= 5).mean()),
+        float((1 / ranks_array).mean()),
+        separation,
+    )
+
+
+def signer_conditional_permutation_p(
+    matrix: np.ndarray,
+    concepts: np.ndarray,
+    signers: np.ndarray,
+    observed_top1: float,
+    permutations: int,
+    seed: int,
+) -> float:
+    rng = np.random.default_rng(seed)
+    exceedances = 0
+    for _ in tqdm(range(permutations), desc="Signer-conditional permutations", leave=False):
+        permuted = concepts.copy()
+        for signer in np.unique(signers):
+            indices = np.flatnonzero(signers == signer)
+            permuted[indices] = rng.permutation(permuted[indices])
+        null_top1 = leave_one_signer_out_scores(matrix, permuted, signers)[0]
+        exceedances += int(null_top1 >= observed_top1)
+    return (1 + exceedances) / (permutations + 1)
+
+
 def probe_codebook_stability(
     features_path: Path,
     output_dir: Path,
@@ -320,55 +384,21 @@ def evaluate_lexical_units(
     matrix = np.stack(histograms)
     concepts = np.asarray([row["id"].strip().lower() for row in rows])
     signers = np.asarray([row["participant_id"].strip() for row in rows])
+    sample_ids = np.asarray([row.get("sample_id", Path(row["path"]).stem) for row in rows])
+    np.savez_compressed(
+        output_dir / "lexical_unit_histograms.npz",
+        features=matrix,
+        concepts=concepts,
+        signers=signers,
+        sample_ids=sample_ids,
+    )
 
-    def score(labels: np.ndarray) -> tuple[float, float, float, float]:
-        ranks = []
-        same_distances = []
-        different_distances = []
-        for signer in sorted(set(signers.tolist())):
-            query_indices = np.flatnonzero(signers == signer)
-            train_indices = np.flatnonzero(signers != signer)
-            candidates, inverse = np.unique(labels[train_indices], return_inverse=True)
-            sums = np.zeros((len(candidates), matrix.shape[1]), dtype=np.float32)
-            np.add.at(sums, inverse, matrix[train_indices])
-            counts = np.bincount(inverse, minlength=len(candidates)).astype(np.float32)
-            prototypes = sums / counts[:, None].clip(min=1)
-            prototypes /= np.linalg.norm(prototypes, axis=1, keepdims=True).clip(min=1e-8)
-            similarities = matrix[query_indices] @ prototypes.T
-            for row_index, query_index in enumerate(query_indices):
-                matches = np.flatnonzero(candidates == labels[query_index])
-                if len(matches) == 0:
-                    ranks.append(len(candidates) + 1)
-                    different_distances.extend((1 - similarities[row_index]).tolist())
-                    continue
-                target = int(matches[0])
-                order = np.argsort(-similarities[row_index])
-                ranks.append(int(np.flatnonzero(order == target)[0]) + 1)
-                same_distances.append(float(1 - similarities[row_index, target]))
-                different_distances.extend(
-                    (1 - np.delete(similarities[row_index], target)).tolist()
-                )
-        ranks = np.asarray(ranks)
-        separation = (
-            float(np.mean(different_distances) - np.mean(same_distances))
-            if same_distances
-            else float("nan")
-        )
-        return (
-            float((ranks == 1).mean()),
-            float((ranks <= 5).mean()),
-            float((1 / ranks).mean()),
-            separation,
-        )
-
-    top1, top5, mrr, separation = score(concepts)
-    rng = np.random.default_rng(seed)
-    null_top1 = []
-    for _ in tqdm(range(permutations), desc="Lexical label permutations", leave=False):
-        permuted = concepts.copy()
-        rng.shuffle(permuted)
-        null_top1.append(score(permuted)[0])
-    p_value = (1 + sum(value >= top1 for value in null_top1)) / (permutations + 1)
+    top1, top5, mrr, separation = leave_one_signer_out_scores(
+        matrix, concepts, signers
+    )
+    p_value = signer_conditional_permutation_p(
+        matrix, concepts, signers, top1, permutations, seed
+    )
     metrics = {
         "tokens": len(rows),
         "concepts": len(set(concepts.tolist())),
@@ -380,6 +410,7 @@ def evaluate_lexical_units(
         "same_vs_different_distance_separation": separation,
         "top1_permutation_p": p_value,
         "permutations": permutations,
+        "permutation_scheme": "concept_labels_shuffled_within_signer",
     }
     (output_dir / "lexical_unit_metrics.json").write_text(
         json.dumps(metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8"

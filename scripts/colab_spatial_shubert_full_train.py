@@ -10,8 +10,6 @@ import time
 import zipfile
 from pathlib import Path
 
-from google.colab import files
-
 from colab_shape_full_train import (
     DEV_ANNOTATION_ID,
     SHARDS,
@@ -53,11 +51,11 @@ def download_resume_bundle(state_path: Path, shard: int) -> None:
                 handle.write(source, f"checkpoints/{name}")
     if not (CHECKPOINT_ROOT / "last.pt").exists():
         raise RuntimeError("Refusing to download a resume bundle without last.pt")
-    print(f"Downloading resumable epoch bundle: {bundle}", flush=True)
-    files.download(str(bundle))
-    for older in Path("/content").glob("spatial_shubert_resume_after_shard_*.zip"):
-        if older != bundle:
-            older.unlink()
+    # google.colab.files.download must run in the notebook kernel, not in this
+    # child Python process.  The notebook launcher recognizes this marker and
+    # initiates the browser download from the parent kernel.
+    print(f"Checkpoint bundle ready: {bundle}", flush=True)
+    print(f"COLAB_DOWNLOAD={bundle}", flush=True)
 
 
 def fit_codebooks(archive: Path, annotations: Path) -> None:
@@ -120,6 +118,7 @@ def write_config(
             "amp": True,
             "progress_every": 1,
             "save_every": 0,
+            "display_total_epochs": len(SHARDS),
         }
     )
     path = Path("/content/colab_spatial_shubert.json")
@@ -168,6 +167,13 @@ def main() -> None:
     prefetch_jobs: dict[int, tuple[subprocess.Popen, Path]] = {}
     for shard, (identifier, expected_md5) in SHARDS.items():
         if shard in completed:
+            completed_archive = LOCAL_ROOT / f"raw_keypoints_{shard}.zip"
+            if completed_archive.exists():
+                completed_archive.unlink()
+                print(
+                    f"Removed stale local data for already-completed shard {shard}.",
+                    flush=True,
+                )
             print(f"Shard {shard} already completed; skipping.", flush=True)
             continue
         print(f"Full progress: {len(completed)}/10 shards; starting shard {shard}.", flush=True)
@@ -202,6 +208,11 @@ def main() -> None:
             prefetch_jobs[next_shard] = (process, log_path)
             print(f"Background prefetch started for shard {next_shard}: {log_path}", flush=True)
 
+        print(
+            f"=== Training global epoch {len(completed) + 1}/{len(SHARDS)} "
+            f"on shard {shard} ===",
+            flush=True,
+        )
         config_path = write_config(
             archive, train_annotations, dev_annotations, len(completed) + 1
         )

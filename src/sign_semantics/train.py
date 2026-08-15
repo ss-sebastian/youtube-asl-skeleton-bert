@@ -549,9 +549,12 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         epoch_totals: dict[str, float] = {"loss": 0.0}
         epoch_keypoint_totals: dict[str, float] = {}
         epoch_clips = 0
+        display_total_epochs = int(
+            train_config.get("display_total_epochs", train_config["epochs"])
+        )
         progress = tqdm(
             total=len(train_data),
-            desc=f"epoch {epoch + 1}/{train_config['epochs']}",
+            desc=f"epoch {epoch + 1}/{display_total_epochs}",
             unit="clips",
             dynamic_ncols=True,
         )

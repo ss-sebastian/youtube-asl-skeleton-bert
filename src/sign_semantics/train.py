@@ -18,10 +18,11 @@ from .data import YouTubeASLPoseDataset
 from .features import STREAM_JOINTS
 from .masking import sample_span_mask
 from .model import SkeletonBert, SkeletonBertConfig, masked_mean
+from .skeleton_codebooks import SkeletonCodebooks, frame_descriptors, split_parts
 from .utils import atomic_torch_save, choose_device, load_json, seed_everything
 
 PCK_THRESHOLDS = (0.1, 0.2)
-OBJECTIVES = ("masked_reconstruction", "next_frame", "contrastive")
+OBJECTIVES = ("masked_reconstruction", "next_frame", "contrastive", "masked_cluster")
 
 
 def move_batch(
@@ -214,6 +215,51 @@ def contrastive_objective(
     return loss, metrics, {}
 
 
+def masked_cluster_objective(
+    model: SkeletonBert,
+    streams: dict[str, torch.Tensor],
+    observed: dict[str, torch.Tensor],
+    valid: torch.Tensor,
+    masking_config: dict,
+    codebooks: SkeletonCodebooks,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, dict[str, float], dict[str, float]]:
+    """SHuBERT-style prediction of frozen, frame-local skeleton clusters."""
+    mask = sample_span_mask(
+        valid,
+        float(masking_config["mask_probability"]),
+        int(masking_config["mean_span_length"]),
+        generator,
+    )
+    hidden = model.encode(streams, valid, mask)
+    assert isinstance(hidden, torch.Tensor)
+    logits = model.predict_clusters(hidden)
+    parts, part_observed = split_parts(streams, observed)
+    losses: list[torch.Tensor] = []
+    correct = 0
+    total = 0
+    metrics: dict[str, float] = {}
+    for name, values in parts.items():
+        usable = mask & valid & (part_observed[name].float().mean(dim=-1) >= 0.5)
+        count = int(usable.sum())
+        if count == 0:
+            metrics[f"{name}_accuracy"] = 0.0
+            continue
+        targets = codebooks.targets(name, frame_descriptors(values)[usable])
+        selected_logits = logits[name][usable]
+        part_loss = F.cross_entropy(selected_logits, targets)
+        part_correct = int((selected_logits.argmax(dim=-1) == targets).sum())
+        losses.append(part_loss)
+        correct += part_correct
+        total += count
+        metrics[f"{name}_loss"] = float(part_loss.detach())
+        metrics[f"{name}_accuracy"] = part_correct / count
+    if not losses:
+        raise ValueError("No sufficiently observed masked frames for cluster prediction")
+    metrics["cluster_accuracy"] = correct / max(total, 1)
+    return torch.stack(losses).mean(), metrics, {}
+
+
 def compute_objective(
     model: SkeletonBert,
     streams: dict[str, torch.Tensor],
@@ -222,6 +268,7 @@ def compute_objective(
     objective_config: dict,
     masking_config: dict,
     generator: torch.Generator | None = None,
+    codebooks: SkeletonCodebooks | None = None,
 ) -> tuple[torch.Tensor, dict[str, float], dict[str, float]]:
     """Run one of the matched-backbone pretraining objectives."""
     name = str(objective_config.get("name", "masked_reconstruction"))
@@ -255,6 +302,12 @@ def compute_objective(
     if name == "contrastive":
         return contrastive_objective(
             model, streams, observed, valid, objective_config, generator
+        )
+    if name == "masked_cluster":
+        if codebooks is None:
+            raise ValueError("masked_cluster requires frozen skeleton codebooks")
+        return masked_cluster_objective(
+            model, streams, observed, valid, masking_config, codebooks, generator
         )
     raise ValueError(f"Unknown objective {name!r}; expected one of {OBJECTIVES}")
 
@@ -340,6 +393,7 @@ def validate(
     device: torch.device,
     objective_config: dict,
     masking_config: dict,
+    codebooks: SkeletonCodebooks | None = None,
 ) -> dict[str, float]:
     model.eval()
     totals: dict[str, float] = {"loss": 0.0}
@@ -357,6 +411,7 @@ def validate(
             objective_config,
             masking_config,
             generator,
+            codebooks,
         )
         add_statistics(keypoint_totals, keypoint_statistics)
         batch_clips = int(valid.shape[0])
@@ -475,6 +530,13 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
     output_dir = Path(train_config["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     mask_config = config["masking"]
+    codebooks = None
+    if objective_name == "masked_cluster":
+        codebook_path = objective_config.get("codebook_path")
+        if not codebook_path:
+            raise ValueError("objective.codebook_path is required for masked_cluster")
+        codebooks = SkeletonCodebooks(codebook_path, device)
+        print(f"Loaded frozen skeleton codebooks from {codebook_path}", flush=True)
 
     for epoch in range(start_epoch, train_config["epochs"]):
         epoch_started = time.perf_counter()
@@ -511,6 +573,7 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
                     valid,
                     objective_config,
                     mask_config,
+                    codebooks=codebooks,
                 )
                 group_start = (batch_index // accumulation) * accumulation
                 group_size = min(accumulation, len(train_loader) - group_start)
@@ -580,6 +643,7 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
             device,
             objective_config,
             mask_config,
+            codebooks,
         )
         epoch_seconds = time.perf_counter() - epoch_started
         epoch_metrics = {

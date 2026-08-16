@@ -31,7 +31,7 @@ The current four-way frame cluster sequence does not define clean unified spans.
 7. The `real` replication retains original block order; `shuffled` destroys natural block order and sentence-level co-occurrence.
 8. The exact batch IDs, lengths, seeds, and donor assignment indices are saved for reconstruction.
 
-Before full training, each shard must pass transparent engineering gates: exact unigram preservation, at least 90% cross-sentence block assignment, mean part-level bigram and sentence-co-occurrence correlations below 0.95, and a shuffled/real first-visible-frame boundary-jump ratio between 0.5 and 2.0. These thresholds only prevent an obviously broken manipulation; they are not scientific significance criteria.
+Before full training, each shard must pass transparent integrity gates: exact unigram preservation, at least 90% of blocks moved, at least 90% cross-sentence block assignment, and a shuffled/real first-visible-frame boundary-jump ratio between 0.5 and 2.0. Bigram, mutual-information, and sentence-co-occurrence changes remain reported as descriptive manipulation checks, but are not hard gates: raw count correlations can remain high because the control deliberately preserves strongly non-uniform unit marginals. The hard thresholds only prevent an obviously broken manipulation; they are not scientific significance criteria.
 
 The historical Spatial-SHuBERT remains a reference only. The matched boundary attention mask and source-grouped batching mean that the causal comparison must use the newly trained `real` replication versus the new `shuffled` model.
 

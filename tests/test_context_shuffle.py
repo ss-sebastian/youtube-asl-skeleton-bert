@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+from sign_semantics.context_diagnostics import context_integrity_gate
 from sign_semantics.context_shuffle import (
     ContextBatchCollator,
     SourceGroupedBatchSampler,
@@ -101,6 +102,30 @@ def test_span_mask_supports_internal_boundary_gaps() -> None:
     assert not mask[~valid].any()
     assert int(mask.sum()) >= 1
     assert mask[:, 9:].any()
+
+
+def test_context_integrity_gate_does_not_gate_on_count_correlations() -> None:
+    summary = {
+        "all_part_unigrams_exactly_preserved": True,
+        "moved_block_fraction": 0.99,
+        "cross_sentence_fraction": 0.98,
+        "real_visible_boundary_jump_mean": 1.0,
+        "shuffled_visible_boundary_jump_mean": 1.25,
+    }
+    gate = context_integrity_gate(summary)
+    assert gate["integrity_pass"] is True
+    assert gate["visible_boundary_jump_ratio"] == pytest.approx(1.25)
+
+
+def test_context_integrity_gate_rejects_failed_reassignment() -> None:
+    summary = {
+        "all_part_unigrams_exactly_preserved": True,
+        "moved_block_fraction": 0.89,
+        "cross_sentence_fraction": 0.98,
+        "real_visible_boundary_jump_mean": 1.0,
+        "shuffled_visible_boundary_jump_mean": 1.0,
+    }
+    assert context_integrity_gate(summary)["integrity_pass"] is False
 
 
 def test_shuffled_tensor_and_cluster_target_alignment(tmp_path) -> None:

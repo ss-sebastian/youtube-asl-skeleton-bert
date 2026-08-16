@@ -428,27 +428,27 @@ class ContextBatchCollator:
         signatures: list[dict[str, int]] | None = None
         if self.codebooks is not None:
             parts, _ = split_parts(original_streams, original_observed)
-            signatures = []
-            for block in blocks:
-                # A diagnostic block unit is the nearest *existing* part
-                # centroid to the block-mean frame descriptor.  It changes no
-                # training target or vocabulary and is far cheaper than a
-                # second full frame-level target pass through the corpus.
-                signatures.append(
-                    {
-                        name: int(
-                            self.codebooks.targets(
-                                name,
-                                frame_descriptors(
-                                    values[
-                                        block.row, block.start : block.stop
-                                    ].mean(dim=0)
-                                ).unsqueeze(0),
-                            )
+            # Vectorize the diagnostic target lookup: one cdist per part and
+            # batch, rather than one cdist per block. This leaves the statistic
+            # unchanged but avoids thousands of tiny CPU kernels per batch.
+            part_units: dict[str, list[int]] = {}
+            for name, values in parts.items():
+                descriptors = torch.stack(
+                    [
+                        frame_descriptors(
+                            values[block.row, block.start : block.stop].mean(dim=0)
                         )
-                        for name, values in parts.items()
-                    }
+                        for block in blocks
+                    ]
                 )
+                part_units[name] = [
+                    int(value)
+                    for value in self.codebooks.targets(name, descriptors)
+                ]
+            signatures = [
+                {name: part_units[name][index] for name in PARTS}
+                for index in range(len(blocks))
+            ]
 
         if self.include_detailed_mapping:
             mapping = []

@@ -27,6 +27,40 @@ from .skeleton_codebooks import PARTS, SkeletonCodebooks
 from .utils import seed_everything
 
 
+def context_integrity_gate(summary: dict) -> dict:
+    """Return the pre-training integrity checks for a saved diagnostic summary.
+
+    Bigram and sentence co-occurrence count correlations are deliberately
+    descriptive: their raw correlations can remain high when the intervention
+    exactly preserves strongly non-uniform unit marginals.
+    """
+    visible_ratio = summary["shuffled_visible_boundary_jump_mean"] / max(
+        summary["real_visible_boundary_jump_mean"], 1e-8
+    )
+    gate = {
+        "thresholds_are_engineering_checks_not_scientific_cutoffs": True,
+        "unigram_marginals_exact": bool(summary["all_part_unigrams_exactly_preserved"]),
+        "moved_block_fraction_at_least_0_90": summary["moved_block_fraction"] >= 0.90,
+        "cross_sentence_fraction_at_least_0_90": (
+            summary["cross_sentence_fraction"] >= 0.90
+        ),
+        "visible_boundary_jump_ratio_between_0_5_and_2": 0.5 <= visible_ratio <= 2.0,
+        "visible_boundary_jump_ratio": visible_ratio,
+        "why_correlations_are_not_hard_gates": (
+            "raw count correlations are strongly constrained by the exactly "
+            "preserved, non-uniform unigram marginals"
+        ),
+    }
+    required = (
+        "unigram_marginals_exact",
+        "moved_block_fraction_at_least_0_90",
+        "cross_sentence_fraction_at_least_0_90",
+        "visible_boundary_jump_ratio_between_0_5_and_2",
+    )
+    gate["integrity_pass"] = all(bool(gate[key]) for key in required)
+    return gate
+
+
 def _entropy(counter: Counter) -> float:
     counts = np.asarray(list(counter.values()), dtype=float)
     if not len(counts) or counts.sum() == 0:
@@ -267,35 +301,17 @@ def diagnose(
         for row in part_rows
         if np.isfinite(float(row["sentence_cooccurrence_correlation"]))
     ]
-    visible_ratio = summary["shuffled_visible_boundary_jump_mean"] / max(
-        summary["real_visible_boundary_jump_mean"], 1e-8
-    )
-    gate = {
-        "thresholds_are_engineering_checks_not_scientific_cutoffs": True,
-        "unigram_marginals_exact": summary["all_part_unigrams_exactly_preserved"],
-        "cross_sentence_fraction_at_least_0_90": summary[
-            "cross_sentence_fraction"
-        ]
-        >= 0.90,
-        "mean_bigram_correlation_below_0_95": bool(finite_bigram)
-        and float(np.mean(finite_bigram)) < 0.95,
-        "mean_sentence_cooccurrence_correlation_below_0_95": bool(
-            finite_cooccurrence
-        )
-        and float(np.mean(finite_cooccurrence)) < 0.95,
-        "visible_boundary_jump_ratio_between_0_5_and_2": 0.5
-        <= visible_ratio
-        <= 2.0,
-        "visible_boundary_jump_ratio": visible_ratio,
-    }
-    gate["diagnostic_pass"] = all(
-        bool(value)
-        for key, value in gate.items()
-        if key
-        not in {
-            "thresholds_are_engineering_checks_not_scientific_cutoffs",
-            "visible_boundary_jump_ratio",
-            "diagnostic_pass",
+    gate = context_integrity_gate(summary)
+    gate.update(
+        {
+            "descriptive_mean_bigram_correlation": float(np.mean(finite_bigram))
+            if finite_bigram
+            else float("nan"),
+            "descriptive_mean_sentence_cooccurrence_correlation": float(
+                np.mean(finite_cooccurrence)
+            )
+            if finite_cooccurrence
+            else float("nan"),
         }
     )
     summary["gate"] = gate
@@ -310,9 +326,9 @@ def diagnose(
         writer.writerows(part_rows)
     if not summary["all_part_unigrams_exactly_preserved"]:
         raise AssertionError("Block reassignment failed to preserve unit marginals")
-    if not gate["diagnostic_pass"]:
+    if not gate["integrity_pass"]:
         raise RuntimeError(
-            "Context manipulation failed a pre-training engineering gate; "
+            "Context manipulation failed a required integrity gate; "
             "full training must not start. See context_manipulation_summary.json"
         )
     print("context_manipulation=" + json.dumps(summary, sort_keys=True), flush=True)

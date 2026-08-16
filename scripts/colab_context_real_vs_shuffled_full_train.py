@@ -215,8 +215,25 @@ def run_tests_and_smoke(
 def run_diagnostics(archive: Path, annotations: Path, shard: int) -> None:
     output = DIAGNOSTIC_ROOT / f"shard_{shard:02d}"
     summary = output / "context_manipulation_summary.json"
+
+    def validate_saved_summary() -> None:
+        from sign_semantics.context_diagnostics import context_integrity_gate
+
+        saved = json.loads(summary.read_text(encoding="utf-8"))
+        gate = context_integrity_gate(saved)
+        print("context_integrity=" + json.dumps(gate, sort_keys=True), flush=True)
+        if not gate["integrity_pass"]:
+            raise RuntimeError(
+                "Context manipulation failed a required integrity check. "
+                f"See {summary}"
+            )
+
     if summary.exists():
-        print(f"Reusing context diagnostic: {summary}", flush=True)
+        print(
+            f"Reusing completed context diagnostic (no 68-minute rerun): {summary}",
+            flush=True,
+        )
+        validate_saved_summary()
         return
     subprocess.run(
         [
@@ -245,6 +262,7 @@ def run_diagnostics(archive: Path, annotations: Path, shard: int) -> None:
         ],
         check=True,
     )
+    validate_saved_summary()
 
 
 def main() -> None:

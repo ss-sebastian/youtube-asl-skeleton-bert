@@ -23,20 +23,21 @@ def sample_span_mask(
     batch, time = valid.shape
     mask = torch.zeros_like(valid)
     for row in range(batch):
-        length = int(valid[row].sum().item())
+        valid_indices = torch.nonzero(valid[row], as_tuple=False).flatten()
+        length = int(valid_indices.numel())
         if length == 0:
             continue
         target = max(1, round(length * probability))
         attempts = 0
         while int(mask[row].sum().item()) < target and attempts < time * 4:
-            start = int(torch.randint(length, (1,), generator=generator).item())
+            selected = int(torch.randint(length, (1,), generator=generator).item())
+            start = int(valid_indices[selected])
             # Geometric-like span variability centered near mean_span_length.
             low = max(1, mean_span_length // 2)
             high = max(low + 1, mean_span_length * 3 // 2 + 1)
             span = int(torch.randint(low, high, (1,), generator=generator).item())
-            mask[row, start : min(length, start + span)] = True
+            mask[row, start : min(time, start + span)] = True
             attempts += 1
         if not mask[row].any():
-            mask[row, 0] = True
+            mask[row, int(valid_indices[0])] = True
     return mask & valid
-

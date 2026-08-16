@@ -14,6 +14,12 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from .context_shuffle import (
+    ContextBatchCollator,
+    SourceGroupedBatchSampler,
+    assert_no_linguistic_supervision,
+    source_groups_for_dataset,
+)
 from .data import YouTubeASLPoseDataset
 from .features import STREAM_JOINTS
 from .masking import sample_span_mask
@@ -429,6 +435,8 @@ def validate(
 
 def run_training(config_path: Path, resume: Path | None = None) -> None:
     config = load_json(config_path)
+    if config.get("context_condition") is not None:
+        assert_no_linguistic_supervision(config)
     objective_config = config.get("objective", {"name": "masked_reconstruction"})
     objective_name = str(objective_config.get("name", "masked_reconstruction"))
     if objective_name not in OBJECTIVES:
@@ -459,6 +467,8 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
     )
     print(f"Indexed {len(val_data):,} validation clips.", flush=True)
     train_config = config["training"]
+    output_dir = Path(train_config["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
     pin_memory = device.type == "cuda"
     worker_options = {}
     if data_config["num_workers"] > 0:
@@ -466,23 +476,76 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
             "persistent_workers": True,
             "prefetch_factor": int(data_config.get("prefetch_factor", 2)),
         }
-    train_loader = DataLoader(
-        train_data,
-        batch_size=train_config["batch_size"],
-        shuffle=True,
-        num_workers=data_config["num_workers"],
-        pin_memory=pin_memory,
-        drop_last=False,
-        **worker_options,
-    )
-    val_loader = DataLoader(
-        val_data,
-        batch_size=train_config["batch_size"],
-        shuffle=False,
-        num_workers=data_config["num_workers"],
-        pin_memory=pin_memory,
-        **worker_options,
-    )
+    context_condition = config.get("context_condition")
+    context_config = dict(config.get("context", {}))
+    train_batch_sampler = None
+    val_batch_sampler = None
+    if context_condition is None:
+        train_loader = DataLoader(
+            train_data,
+            batch_size=train_config["batch_size"],
+            shuffle=True,
+            num_workers=data_config["num_workers"],
+            pin_memory=pin_memory,
+            drop_last=False,
+            **worker_options,
+        )
+        val_loader = DataLoader(
+            val_data,
+            batch_size=train_config["batch_size"],
+            shuffle=False,
+            num_workers=data_config["num_workers"],
+            pin_memory=pin_memory,
+            **worker_options,
+        )
+    else:
+        block_frames = int(context_config.get("block_frames", 16))
+        boundary_mask_frames = int(context_config.get("boundary_mask_frames", 1))
+        shuffle_seed = int(context_config.get("shuffle_seed", config["seed"]))
+        train_batch_sampler = SourceGroupedBatchSampler(
+            source_groups_for_dataset(train_data),
+            int(train_config["batch_size"]),
+            int(config["seed"]),
+            True,
+        )
+        val_batch_sampler = SourceGroupedBatchSampler(
+            source_groups_for_dataset(val_data),
+            int(train_config["batch_size"]),
+            int(config["seed"]) + 10_000,
+            False,
+        )
+        train_loader = DataLoader(
+            train_data,
+            batch_sampler=train_batch_sampler,
+            collate_fn=ContextBatchCollator(
+                str(context_condition),
+                block_frames,
+                boundary_mask_frames,
+                shuffle_seed,
+            ),
+            num_workers=data_config["num_workers"],
+            pin_memory=pin_memory,
+            **worker_options,
+        )
+        val_loader = DataLoader(
+            val_data,
+            batch_sampler=val_batch_sampler,
+            collate_fn=ContextBatchCollator(
+                str(context_condition),
+                block_frames,
+                boundary_mask_frames,
+                shuffle_seed + 1,
+            ),
+            num_workers=data_config["num_workers"],
+            pin_memory=pin_memory,
+            **worker_options,
+        )
+        print(
+            f"Context condition={context_condition}; local blocks={block_frames} frames; "
+            f"matched boundary mask={boundary_mask_frames} frame(s) per side; "
+            "source-video-grouped deterministic batches.",
+            flush=True,
+        )
     print(
         f"DataLoaders ready: batch_size={train_config['batch_size']}, "
         f"workers={data_config['num_workers']}, train_batches={len(train_loader):,}.",
@@ -519,6 +582,12 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
                 f"Checkpoint objective {checkpoint_objective!r} does not match "
                 f"configured objective {objective_name!r}"
             )
+        checkpoint_context = checkpoint.get("context_condition")
+        if checkpoint_context != context_condition:
+            raise ValueError(
+                f"Checkpoint context {checkpoint_context!r} does not match "
+                f"configured context {context_condition!r}"
+            )
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -527,8 +596,6 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         best_val = float(checkpoint.get("best_val", best_val))
         print(f"Resumed from epoch {start_epoch}", flush=True)
 
-    output_dir = Path(train_config["output_dir"])
-    output_dir.mkdir(parents=True, exist_ok=True)
     mask_config = config["masking"]
     codebooks = None
     if objective_name == "masked_cluster":
@@ -539,6 +606,10 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         print(f"Loaded frozen skeleton codebooks from {codebook_path}", flush=True)
 
     for epoch in range(start_epoch, train_config["epochs"]):
+        if train_batch_sampler is not None:
+            train_batch_sampler.set_epoch(epoch)
+        if val_batch_sampler is not None:
+            val_batch_sampler.set_epoch(epoch)
         epoch_started = time.perf_counter()
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
@@ -548,7 +619,10 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         logged_batches = 0
         epoch_totals: dict[str, float] = {"loss": 0.0}
         epoch_keypoint_totals: dict[str, float] = {}
+        context_audit_totals: dict[str, float] = {}
+        epoch_mapping_records: list[dict] = []
         epoch_clips = 0
+        mapping_path = output_dir / f"context_mapping_epoch_{epoch + 1:03d}.jsonl"
         display_total_epochs = int(
             train_config.get("display_total_epochs", train_config["epochs"])
         )
@@ -562,6 +636,42 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
         for batch_index, batch in enumerate(train_loader):
             if batch_index == 0:
                 print("First batch loaded; GPU training has started.", flush=True)
+            if context_condition is not None:
+                audit = batch["context_batch_audit"]
+                weight = float(audit["blocks"])
+                context_audit_totals["blocks"] = (
+                    context_audit_totals.get("blocks", 0.0) + weight
+                )
+                for name in (
+                    "moved_block_fraction",
+                    "cross_sentence_fraction",
+                    "same_source_fraction",
+                ):
+                    context_audit_totals[name] = (
+                        context_audit_totals.get(name, 0.0)
+                        + float(audit[name]) * weight
+                    )
+                mapping_record = {
+                    "condition": context_condition,
+                    "epoch": epoch + 1,
+                    "batch": batch_index,
+                    "ids": [str(value) for value in batch["id"]],
+                    "source_groups": [str(value) for value in batch["source_group"]],
+                    "lengths": [
+                        int(value) for value in batch["context_original_lengths"]
+                    ],
+                    "assignment": [
+                        int(value) for value in batch["context_assignment"]
+                    ],
+                    "block_frames": int(context_config.get("block_frames", 16)),
+                    "boundary_mask_frames": int(
+                        context_config.get("boundary_mask_frames", 1)
+                    ),
+                    "shuffle_seed": int(
+                        context_config.get("shuffle_seed", config["seed"])
+                    ),
+                }
+                epoch_mapping_records.append(mapping_record)
             streams, observed, valid = move_batch(batch, device)
             autocast = (
                 torch.autocast(device_type="cuda", dtype=torch.float16)
@@ -634,12 +744,29 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
                     running = 0.0
                     logged_batches = 0
         progress.close()
+        if epoch_mapping_records:
+            with mapping_path.open("w", encoding="utf-8") as handle:
+                handle.writelines(
+                    json.dumps(record, sort_keys=True) + "\n"
+                    for record in epoch_mapping_records
+                )
 
         train_metrics = {
             name: value / max(epoch_clips, 1) for name, value in epoch_totals.items()
         }
         if epoch_keypoint_totals:
             train_metrics.update(summarize_keypoint_statistics(epoch_keypoint_totals))
+        context_blocks = context_audit_totals.get("blocks", 0.0)
+        if context_blocks:
+            train_metrics["context_blocks"] = context_blocks
+            for name in (
+                "moved_block_fraction",
+                "cross_sentence_fraction",
+                "same_source_fraction",
+            ):
+                train_metrics[f"context_{name}"] = (
+                    context_audit_totals[name] / context_blocks
+                )
         val_metrics = validate(
             model,
             val_loader,
@@ -707,6 +834,8 @@ def run_training(config_path: Path, resume: Path | None = None) -> None:
             "model_config": model_config.to_dict(),
             "objective": objective_name,
             "objective_config": objective_config,
+            "context_condition": context_condition,
+            "context_config": context_config,
         }
         atomic_torch_save(payload, output_dir / "last.pt")
         if val_loss < best_val:

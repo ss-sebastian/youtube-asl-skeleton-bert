@@ -12,23 +12,35 @@ from torch.utils.data import Dataset
 from .features import COORDINATE_DIM, FACE_LANDMARKS, STREAM_JOINTS, normalize_youtube_asl
 
 
-def annotation_clip_ids(path: str | Path) -> set[str]:
-    """Read only clip IDs from the official annotation file.
+def annotation_clip_sources(path: str | Path) -> dict[str, str]:
+    """Read only clip and source-video IDs from the annotation structure.
 
     Translation strings exist in the same file but are deliberately ignored by
-    self-supervised pretraining.
+    self-supervised pretraining.  The top-level key is used only as a
+    non-linguistic source grouping for matched context shuffling; it is not
+    asserted to identify a unique signer.
     """
     annotations = orjson.loads(Path(path).read_bytes())
-    clip_ids: set[str] = set()
-    for video in annotations.values():
+    clip_sources: dict[str, str] = {}
+    for source_id, video in annotations.items():
         if not isinstance(video, dict):
             continue
         order = video.get("clip_order")
         if isinstance(order, list):
-            clip_ids.update(str(value) for value in order)
+            clips = [str(value) for value in order]
         else:
-            clip_ids.update(str(key) for key in video if key != "clip_order")
-    return clip_ids
+            clips = [str(key) for key in video if key != "clip_order"]
+        for clip_id in clips:
+            previous = clip_sources.get(clip_id)
+            if previous is not None and previous != str(source_id):
+                raise ValueError(f"Clip {clip_id!r} occurs under multiple source videos")
+            clip_sources[clip_id] = str(source_id)
+    return clip_sources
+
+
+def annotation_clip_ids(path: str | Path) -> set[str]:
+    """Backward-compatible structural clip-ID reader."""
+    return set(annotation_clip_sources(path))
 
 
 def _landmarks(frame: dict[str, Any], key: str, joints: int) -> tuple[np.ndarray, np.ndarray]:
@@ -122,7 +134,8 @@ class YouTubeASLPoseDataset(Dataset[dict[str, torch.Tensor | str]]):
         self.training = training
         self.data_key = data_key
         self._zip: zipfile.ZipFile | None = None
-        allowed = annotation_clip_ids(annotations)
+        clip_sources = annotation_clip_sources(annotations)
+        allowed = set(clip_sources)
 
         if self.is_remote:
             from remotezip import RemoteZip
@@ -162,6 +175,10 @@ class YouTubeASLPoseDataset(Dataset[dict[str, torch.Tensor | str]]):
             raise ValueError(
                 f"No clips in {self.archive_source} matched annotations from {annotations}"
             )
+        self.source_groups = {
+            clip_id: clip_sources.get(clip_id, "__unknown_source__")
+            for clip_id in (PurePosixPath(member).stem for member in self.members)
+        }
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
@@ -209,6 +226,7 @@ class YouTubeASLPoseDataset(Dataset[dict[str, torch.Tensor | str]]):
         length = streams["body"].shape[0]
         item: dict[str, torch.Tensor | str] = {
             "id": PurePosixPath(self.members[index]).stem,
+            "source_group": self.source_groups[PurePosixPath(self.members[index]).stem],
         }
         for name, joints in STREAM_JOINTS.items():
             padded = np.zeros(
